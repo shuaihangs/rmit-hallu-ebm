@@ -1,134 +1,282 @@
-import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score
-from .utils import safe_auc, safe_mean
+
+from sklearn.metrics import accuracy_score, roc_auc_score
+
 from .model import forward_energy
 
 
+def safe_auc(labels, scores):
+    """
+    Safe ROC-AUC.
+
+    Returns nan if only one class is present.
+    """
+    try:
+        return float(roc_auc_score(labels, scores))
+    except Exception:
+        return float("nan")
+
+
+def safe_mean(x):
+    """
+    Safe mean for numpy arrays / tensors.
+    """
+    try:
+        if len(x) == 0:
+            return float("nan")
+        return float(x.mean())
+    except Exception:
+        return float("nan")
+
+
 @torch.no_grad()
-def evaluate_loader(loader, base_model, energy_model, device):
+def evaluate_loader(
+    loader,
+    base_model,
+    energy_model,
+    device,
+):
+    """
+    Evaluate hallucination detection.
+
+    Supports two formats:
+
+    1. Single-sample batches:
+        input_ids
+        attention_mask
+        answer_mask
+        labels
+
+    2. Paired batches:
+        pos_input_ids
+        pos_attention_mask
+        pos_answer_mask
+        neg_input_ids
+        neg_attention_mask
+        neg_answer_mask
+
+    Convention:
+        truthful / positive      -> label 0, lower energy
+        hallucinated / negative  -> label 1, higher energy
+    """
+
+    base_model.eval()
     energy_model.eval()
-    all_labels, all_logits, all_probs = [], [], []
 
-    # Removed layer disagreement.
-    # all_layer_mean, all_layer_std = [], []
+    all_labels = []
+    all_logits = []
+    all_probs = []
 
-    all_update_mean, all_update_std, all_update_max = [], [], []
-    all_update_last, all_update_range, all_update_trend = [], [], []
-    all_early_late_update_gap = []
-    total_loss, total_count = 0.0, 0
+    all_pos_logits = []
+    all_neg_logits = []
+
+    scalar_logs = {}
+
+    total_loss = 0.0
+    total_count = 0
+
+    def collect_scalar_logs(out):
+        """
+        Collect compact scalar diagnostics from model output.
+
+        This avoids hard-coding old features like update_mean.
+        """
+        skip_keys = {
+            "energy_logit",
+            "hallucination_prob",
+            "raw_features",
+            "features",
+        }
+
+        for key, value in out.items():
+            if key in skip_keys:
+                continue
+
+            if torch.is_tensor(value) and value.dim() == 1:
+                if key not in scalar_logs:
+                    scalar_logs[key] = []
+                scalar_logs[key].append(value.detach().cpu())
 
     for batch in loader:
-        labels = batch["labels"].to(device)
-        out = forward_energy(base_model, energy_model, batch["input_ids"], batch["attention_mask"], device)
-        logits = out["energy_logit"]
-        probs = out["hallucination_prob"]
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        # ---------------------------------------------------------
+        # Case 1: paired batch
+        # ---------------------------------------------------------
+        if "pos_input_ids" in batch and "neg_input_ids" in batch:
+            pos_out = forward_energy(
+                base_model,
+                energy_model,
+                batch["pos_input_ids"],
+                batch["pos_attention_mask"],
+                device,
+                answer_mask=batch.get("pos_answer_mask", None),
+            )
 
-        bs = labels.size(0)
-        total_loss += loss.item() * bs
-        total_count += bs
+            neg_out = forward_energy(
+                base_model,
+                energy_model,
+                batch["neg_input_ids"],
+                batch["neg_attention_mask"],
+                device,
+                answer_mask=batch.get("neg_answer_mask", None),
+            )
 
-        all_labels.append(labels.cpu())
-        all_logits.append(logits.cpu())
-        all_probs.append(probs.cpu())
+            pos_logits = pos_out["energy_logit"]
+            neg_logits = neg_out["energy_logit"]
 
-        # Removed layer disagreement.
-        # all_layer_mean.append(out["layer_disagreement"].cpu())
-        # all_layer_std.append(out["layer_disagreement_std"].cpu())
+            pos_labels = torch.zeros_like(pos_logits)
+            neg_labels = torch.ones_like(neg_logits)
 
-        all_update_mean.append(out["update_mean"].cpu())
-        all_update_std.append(out["update_std"].cpu())
-        all_update_max.append(out["update_max"].cpu())
-        all_update_last.append(out["update_last"].cpu())
-        all_update_range.append(out["update_range"].cpu())
-        all_update_trend.append(out["update_trend"].cpu())
-        all_early_late_update_gap.append(out["early_late_update_gap"].cpu())
+            logits = torch.cat([pos_logits, neg_logits], dim=0)
+            labels = torch.cat([pos_labels, neg_labels], dim=0)
 
-    all_labels = torch.cat(all_labels).numpy()
-    all_logits = torch.cat(all_logits).numpy()
-    all_probs = torch.cat(all_probs).numpy()
+            loss = F.binary_cross_entropy_with_logits(
+                logits,
+                labels,
+            )
 
-    # Removed layer disagreement.
-    # all_layer_mean = torch.cat(all_layer_mean).numpy()
-    # all_layer_std = torch.cat(all_layer_std).numpy()
+            probs = torch.sigmoid(logits)
 
-    all_update_mean = torch.cat(all_update_mean).numpy()
-    all_update_std = torch.cat(all_update_std).numpy()
-    all_update_max = torch.cat(all_update_max).numpy()
-    all_update_last = torch.cat(all_update_last).numpy()
-    all_update_range = torch.cat(all_update_range).numpy()
-    all_update_trend = torch.cat(all_update_trend).numpy()
-    all_early_late_update_gap = torch.cat(all_early_late_update_gap).numpy()
+            bs = labels.size(0)
+            total_loss += float(loss.detach().cpu().item()) * bs
+            total_count += bs
+
+            all_labels.append(labels.detach().cpu())
+            all_logits.append(logits.detach().cpu())
+            all_probs.append(probs.detach().cpu())
+
+            all_pos_logits.append(pos_logits.detach().cpu())
+            all_neg_logits.append(neg_logits.detach().cpu())
+
+            collect_scalar_logs(pos_out)
+            collect_scalar_logs(neg_out)
+
+        # ---------------------------------------------------------
+        # Case 2: single labelled examples
+        # ---------------------------------------------------------
+        elif "input_ids" in batch and "labels" in batch:
+            labels = batch["labels"].to(device).float()
+
+            out = forward_energy(
+                base_model,
+                energy_model,
+                batch["input_ids"],
+                batch["attention_mask"],
+                device,
+                answer_mask=batch.get("answer_mask", None),
+            )
+
+            logits = out["energy_logit"]
+            probs = out["hallucination_prob"]
+
+            loss = F.binary_cross_entropy_with_logits(
+                logits,
+                labels,
+            )
+
+            bs = labels.size(0)
+            total_loss += float(loss.detach().cpu().item()) * bs
+            total_count += bs
+
+            all_labels.append(labels.detach().cpu())
+            all_logits.append(logits.detach().cpu())
+            all_probs.append(probs.detach().cpu())
+
+            collect_scalar_logs(out)
+
+        else:
+            raise KeyError(
+                "Unsupported batch format. Expected either paired keys "
+                "pos_input_ids/neg_input_ids or single keys input_ids/labels."
+            )
+
+    all_labels = torch.cat(all_labels, dim=0).float().numpy()
+    all_logits = torch.cat(all_logits, dim=0).float().numpy()
+    all_probs = torch.cat(all_probs, dim=0).float().numpy()
 
     pred_labels = (all_probs >= 0.5).astype(int)
+
     pos_mask = all_labels == 0
     neg_mask = all_labels == 1
 
-    return {
+    metrics = {
         "loss": total_loss / max(total_count, 1),
-        "accuracy": accuracy_score(all_labels, pred_labels),
+        "accuracy": float(accuracy_score(all_labels, pred_labels)),
+
+        # Since sigmoid is monotonic, logit_auc and energy_auc should be similar.
         "energy_auc": safe_auc(all_labels, all_probs),
         "logit_auc": safe_auc(all_labels, all_logits),
 
-        # Removed layer disagreement.
-        # "layer_mean_auc": safe_auc(all_labels, all_layer_mean),
-        # "layer_std_auc": safe_auc(all_labels, all_layer_std),
-
-        "update_mean_auc": safe_auc(all_labels, all_update_mean),
-        "update_std_auc": safe_auc(all_labels, all_update_std),
-        "update_max_auc": safe_auc(all_labels, all_update_max),
-        "update_last_auc": safe_auc(all_labels, all_update_last),
-        "update_range_auc": safe_auc(all_labels, all_update_range),
-        "update_trend_auc": safe_auc(all_labels, all_update_trend),
-        "early_late_update_gap_auc": safe_auc(all_labels, all_early_late_update_gap),
-
         "mean_prob_positive": safe_mean(all_probs[pos_mask]),
         "mean_prob_negative": safe_mean(all_probs[neg_mask]),
+
         "mean_logit_positive": safe_mean(all_logits[pos_mask]),
         "mean_logit_negative": safe_mean(all_logits[neg_mask]),
 
-        # Removed layer disagreement.
-        # "mean_layer_positive": safe_mean(all_layer_mean[pos_mask]),
-        # "mean_layer_negative": safe_mean(all_layer_mean[neg_mask]),
-        # "mean_layer_std_positive": safe_mean(all_layer_std[pos_mask]),
-        # "mean_layer_std_negative": safe_mean(all_layer_std[neg_mask]),
-
-        "mean_update_mean_positive": safe_mean(all_update_mean[pos_mask]),
-        "mean_update_mean_negative": safe_mean(all_update_mean[neg_mask]),
-        "mean_update_std_positive": safe_mean(all_update_std[pos_mask]),
-        "mean_update_std_negative": safe_mean(all_update_std[neg_mask]),
-        "mean_update_max_positive": safe_mean(all_update_max[pos_mask]),
-        "mean_update_max_negative": safe_mean(all_update_max[neg_mask]),
-        "mean_update_last_positive": safe_mean(all_update_last[pos_mask]),
-        "mean_update_last_negative": safe_mean(all_update_last[neg_mask]),
-        "mean_update_range_positive": safe_mean(all_update_range[pos_mask]),
-        "mean_update_range_negative": safe_mean(all_update_range[neg_mask]),
-        "mean_update_trend_positive": safe_mean(all_update_trend[pos_mask]),
-        "mean_update_trend_negative": safe_mean(all_update_trend[neg_mask]),
-        "mean_early_late_update_gap_positive": safe_mean(all_early_late_update_gap[pos_mask]),
-        "mean_early_late_update_gap_negative": safe_mean(all_early_late_update_gap[neg_mask]),
+        "mean_pos_energy": safe_mean(all_logits[pos_mask]),
+        "mean_neg_energy": safe_mean(all_logits[neg_mask]),
+        "energy_gap": (
+            safe_mean(all_logits[neg_mask])
+            -
+            safe_mean(all_logits[pos_mask])
+        ),
     }
+
+    # Pairwise accuracy if paired batches were used.
+    if len(all_pos_logits) > 0 and len(all_neg_logits) > 0:
+        pos_logits_all = torch.cat(all_pos_logits, dim=0).float()
+        neg_logits_all = torch.cat(all_neg_logits, dim=0).float()
+
+        metrics["pairwise_accuracy"] = float(
+            (pos_logits_all < neg_logits_all).float().mean().item()
+        )
+
+    # Add scalar diagnostics such as projection norms / selected indices.
+    for key, values in scalar_logs.items():
+        values = torch.cat(values, dim=0).float()
+        metrics[f"{key}_mean"] = float(values.mean().item())
+        metrics[f"{key}_std"] = float(values.std(unbiased=False).item())
+
+    return metrics
 
 
 def print_metrics(name, metrics):
+    """
+    Print core metrics safely.
+    """
+
     print(f"\n=== {name} ===")
-    print(f"Loss: {metrics['loss']:.4f}")
-    print(f"Accuracy at threshold 0.5: {metrics['accuracy']:.4f}")
-    print(f"ROC-AUC using P(hallucinated): {metrics['energy_auc']:.4f}")
-    print(f"ROC-AUC using raw energy logit: {metrics['logit_auc']:.4f}")
 
-    # Removed layer disagreement.
-    # print(f"ROC-AUC using layer disagreement mean: {metrics['layer_mean_auc']:.4f}")
-    # print(f"ROC-AUC using layer disagreement std: {metrics['layer_std_auc']:.4f}")
+    print(f"Loss:                         {metrics.get('loss', float('nan')):.4f}")
+    print(f"Accuracy at threshold 0.5:    {metrics.get('accuracy', float('nan')):.4f}")
+    print(f"ROC-AUC using P(hallucinated): {metrics.get('energy_auc', float('nan')):.4f}")
+    print(f"ROC-AUC using raw energy logit:{metrics.get('logit_auc', float('nan')):.4f}")
 
-    print(f"ROC-AUC using update mean: {metrics['update_mean_auc']:.4f}")
-    print(f"ROC-AUC using update std: {metrics['update_std_auc']:.4f}")
-    print(f"ROC-AUC using update max: {metrics['update_max_auc']:.4f}")
-    print(f"ROC-AUC using update last: {metrics['update_last_auc']:.4f}")
-    print(f"ROC-AUC using update range: {metrics['update_range_auc']:.4f}")
-    print(f"ROC-AUC using update trend: {metrics['update_trend_auc']:.4f}")
-    print(f"ROC-AUC using early-late update gap: {metrics['early_late_update_gap_auc']:.4f}")
-    print(f"Mean P(hallucinated) positive: {metrics['mean_prob_positive']:.4f}")
-    print(f"Mean P(hallucinated) negative: {metrics['mean_prob_negative']:.4f}")
+    if "pairwise_accuracy" in metrics:
+        print(f"Pairwise accuracy:            {metrics['pairwise_accuracy']:.4f}")
+
+    print(f"Mean P(hallu) positive:       {metrics.get('mean_prob_positive', float('nan')):.4f}")
+    print(f"Mean P(hallu) negative:       {metrics.get('mean_prob_negative', float('nan')):.4f}")
+
+    print(f"Mean pos energy/logit:        {metrics.get('mean_pos_energy', float('nan')):.4f}")
+    print(f"Mean neg energy/logit:        {metrics.get('mean_neg_energy', float('nan')):.4f}")
+    print(f"Energy gap:                   {metrics.get('energy_gap', float('nan')):.4f}")
+
+    # Projection diagnostics if available.
+    optional_keys = [
+        "proj_layer1_norm_mean",
+        "proj_early_middle_norm_mean",
+        "proj_middle_norm_mean",
+        "proj_late_middle_norm_mean",
+        "proj_last_norm_mean",
+
+        "selected_layer1_idx_mean",
+        "selected_early_middle_idx_mean",
+        "selected_middle_idx_mean",
+        "selected_late_middle_idx_mean",
+        "selected_last_idx_mean",
+    ]
+
+    for key in optional_keys:
+        if key in metrics:
+            print(f"{key}: {metrics[key]:.4f}")

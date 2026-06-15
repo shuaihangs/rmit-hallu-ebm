@@ -11,11 +11,11 @@ def reshape_neighbour_logits(flat_logits, k_list):
     Convert flat neighbour logits [sum(k_i)] into mean neighbour energy per item [batch].
 
     Example:
-      flat_logits = energies for all neighbours in the batch flattened together
-      k_list      = number of neighbours for each original item
+        flat_logits = energies for all neighbours in the batch flattened together
+        k_list      = number of neighbours for each original item
 
     Returns:
-      mean_logits = [batch]
+        mean_logits = [batch]
     """
     means = []
     start = 0
@@ -40,54 +40,88 @@ def reshape_neighbour_logits(flat_logits, k_list):
     return torch.stack(means, dim=0)
 
 
-def compute_rank_neighbour_cluster_loss(
+def compute_energy_losses(
     pos_logits,
     neg_logits,
     neigh_pos_logits=None,
     neigh_neg_logits=None,
-    lambda_neighbour_rank=0.5,
-    lambda_cluster=0.5,
-    rank_margin=1,
-    neighbour_margin=0.5,
+    lambda_pair_rank=0.5,
+    lambda_bce=1.0,
+    lambda_inbatch_rank=0.2,
+    lambda_neighbour_rank=0.1,
+    lambda_cluster=0.0,
+    rank_margin=1.0,
+    neighbour_margin=1.0,
     detach_neighbour_anchors=True,
 ):
     """
-    Clean proposed objective:
-
-        L = L_rank
-            + lambda * L_neighbour_rank
-            + beta * L_cluster
+    Improved projection-EBM objective.
 
     Convention:
-        positive/truthful answer      -> lower energy
-        negative/hallucinated answer  -> higher energy
+        positive / truthful      -> label 0, lower energy/logit
+        negative / hallucinated  -> label 1, higher energy/logit
 
-    Pair ranking loss:
-        L_rank = max(0, gamma + E_pos - E_neg)
-
-    Neighbour ranking loss:
-        L_neighbour_rank = max(0, gamma_n + mean(E_neigh_pos) - mean(E_neigh_neg))
-
-    Cluster compactness loss:
-        L_cluster = (E_pos - mean(E_neigh_pos))^2
-                  + (E_neg - mean(E_neigh_neg))^2
+    Loss:
+        L = lambda_bce * BCE
+          + lambda_pair_rank * PairRank
+          + lambda_inbatch_rank * InBatchRank
+          + lambda_neighbour_rank * NeighbourRank
+          + lambda_cluster * Cluster
     """
 
+    # ---------------------------------------------------------
+    # 1. BCE global calibration loss
+    # ---------------------------------------------------------
+    pos_labels = torch.zeros_like(pos_logits)
+    neg_labels = torch.ones_like(neg_logits)
+
+    bce_pos = F.binary_cross_entropy_with_logits(
+        pos_logits,
+        pos_labels,
+    )
+
+    bce_neg = F.binary_cross_entropy_with_logits(
+        neg_logits,
+        neg_labels,
+    )
+
+    bce_loss = 0.5 * (bce_pos + bce_neg)
+
+    # ---------------------------------------------------------
+    # 2. Pair ranking loss
+    # Matched pair: E_pos should be lower than E_neg.
+    # ---------------------------------------------------------
     pair_rank_loss = F.relu(
         rank_margin + pos_logits - neg_logits
     ).mean()
 
+    # ---------------------------------------------------------
+    # 3. In-batch ranking loss
+    # Every pos_logits - neg positive in the batch should be lower than every negative.
+    # ---------------------------------------------------------
+    pos_matrix = pos_logits.unsqueeze(1)  # [B, 1]
+    neg_matrix = neg_logits.unsqueeze(0)  # [1, B]
+
+    inbatch_rank_loss = F.relu(
+        rank_margin + pos_matrix - neg_matrix
+    ).mean()
+
+    # ---------------------------------------------------------
+    # 4. Neighbour ranking + optional cluster compactness
+    # ---------------------------------------------------------
     if neigh_pos_logits is None or neigh_neg_logits is None:
         neighbour_rank_loss = torch.zeros(
             (),
             device=pos_logits.device,
             dtype=pos_logits.dtype,
         )
+
         cluster_loss = torch.zeros(
             (),
             device=pos_logits.device,
             dtype=pos_logits.dtype,
         )
+
     else:
         neighbour_rank_loss = F.relu(
             neighbour_margin + neigh_pos_logits - neigh_neg_logits
@@ -101,23 +135,61 @@ def compute_rank_neighbour_cluster_loss(
             neg_anchor = neigh_neg_logits
 
         cluster_loss = (
-                F.smooth_l1_loss(pos_logits, pos_anchor)
-                +
-                F.smooth_l1_loss(neg_logits, neg_anchor)
-            )
+            F.smooth_l1_loss(pos_logits, pos_anchor)
+            +
+            F.smooth_l1_loss(neg_logits, neg_anchor)
+        )
 
+    # ---------------------------------------------------------
+    # Total loss
+    # ---------------------------------------------------------
     total_loss = (
-        pair_rank_loss
+        lambda_bce * bce_loss
+        + lambda_pair_rank * pair_rank_loss
+        + lambda_inbatch_rank * inbatch_rank_loss
         + lambda_neighbour_rank * neighbour_rank_loss
         + lambda_cluster * cluster_loss
     )
 
     return {
         "total_loss": total_loss,
+        "bce_loss": bce_loss,
         "pair_rank_loss": pair_rank_loss,
+        "inbatch_rank_loss": inbatch_rank_loss,
         "neighbour_rank_loss": neighbour_rank_loss,
         "cluster_loss": cluster_loss,
     }
+
+
+# Backward-compatible alias.
+def compute_rank_neighbour_cluster_loss(
+    pos_logits,
+    neg_logits,
+    neigh_pos_logits=None,
+    neigh_neg_logits=None,
+    lambda_pair_rank=0.5,
+    lambda_bce=1.0,
+    lambda_inbatch_rank=0.2,
+    lambda_neighbour_rank=0.1,
+    lambda_cluster=0.0,
+    rank_margin=1.0,
+    neighbour_margin=1.0,
+    detach_neighbour_anchors=True,
+):
+    return compute_energy_losses(
+        pos_logits=pos_logits,
+        neg_logits=neg_logits,
+        neigh_pos_logits=neigh_pos_logits,
+        neigh_neg_logits=neigh_neg_logits,
+        lambda_pair_rank=lambda_pair_rank,
+        lambda_bce=lambda_bce,
+        lambda_inbatch_rank=lambda_inbatch_rank,
+        lambda_neighbour_rank=lambda_neighbour_rank,
+        lambda_cluster=lambda_cluster,
+        rank_margin=rank_margin,
+        neighbour_margin=neighbour_margin,
+        detach_neighbour_anchors=detach_neighbour_anchors,
+    )
 
 
 def train_one_epoch(
@@ -127,29 +199,35 @@ def train_one_epoch(
     optimizer,
     device,
     grad_clip=1.0,
-    lambda_neighbour_rank=0.5,
-    lambda_cluster=0.1,
-    rank_margin=0.5,
-    neighbour_margin=0.5,
+    lambda_pair_rank=0.5,
+    lambda_bce=1.0,
+    lambda_inbatch_rank=0.2,
+    lambda_neighbour_rank=0.1,
+    lambda_cluster=0.0,
+    rank_margin=1.0,
+    neighbour_margin=1.0,
     detach_neighbour_anchors=True,
 ):
     """
-    One epoch of rank + neighbour-rank + cluster training.
+    One epoch of projection-EBM training.
 
-    This version removes:
-      - BCE loss
-      - energy-bound loss
-      - alpha, m_in, m_out
+    Recommended starting objective:
 
-    It only uses:
-
-        L = L_rank + lambda L_neighbour_rank + beta L_cluster
+        L = 1.0 * BCE
+          + 0.5 * PairRank
+          + 0.2 * InBatchRank
+          + 0.1 * NeighbourRank
+          + 0.0 * Cluster
     """
+
+    base_model.eval()
     energy_model.train()
 
     running = {
         "total_loss": 0.0,
+        "bce_loss": 0.0,
         "pair_rank_loss": 0.0,
+        "inbatch_rank_loss": 0.0,
         "neighbour_rank_loss": 0.0,
         "cluster_loss": 0.0,
     }
@@ -159,20 +237,28 @@ def train_one_epoch(
     for batch in train_loader:
         optimizer.zero_grad(set_to_none=True)
 
+        # ---------------------------------------------------------
+        # Positive / truthful examples
+        # ---------------------------------------------------------
         pos_out = forward_energy(
             base_model,
             energy_model,
             batch["pos_input_ids"],
             batch["pos_attention_mask"],
             device,
+            answer_mask=batch.get("pos_answer_mask", None),
         )
 
+        # ---------------------------------------------------------
+        # Negative / hallucinated examples
+        # ---------------------------------------------------------
         neg_out = forward_energy(
             base_model,
             energy_model,
             batch["neg_input_ids"],
             batch["neg_attention_mask"],
             device,
+            answer_mask=batch.get("neg_answer_mask", None),
         )
 
         pos_logits = pos_out["energy_logit"]
@@ -181,13 +267,24 @@ def train_one_epoch(
         neigh_pos_logits = None
         neigh_neg_logits = None
 
-        if batch.get("has_neighbours", False):
+        # ---------------------------------------------------------
+        # Optional neighbours
+        # ---------------------------------------------------------
+        has_neighbours = batch.get("has_neighbours", False)
+
+        if torch.is_tensor(has_neighbours):
+            has_neighbours = bool(has_neighbours.any().item())
+        else:
+            has_neighbours = bool(has_neighbours)
+
+        if has_neighbours:
             neigh_pos_out = forward_energy(
                 base_model,
                 energy_model,
                 batch["neigh_pos_input_ids"],
                 batch["neigh_pos_attention_mask"],
                 device,
+                answer_mask=batch.get("neigh_pos_answer_mask", None),
             )
 
             neigh_neg_out = forward_energy(
@@ -196,6 +293,7 @@ def train_one_epoch(
                 batch["neigh_neg_input_ids"],
                 batch["neigh_neg_attention_mask"],
                 device,
+                answer_mask=batch.get("neigh_neg_answer_mask", None),
             )
 
             neigh_pos_logits = reshape_neighbour_logits(
@@ -208,11 +306,17 @@ def train_one_epoch(
                 batch["k_list"],
             )
 
-        loss_dict = compute_rank_neighbour_cluster_loss(
+        # ---------------------------------------------------------
+        # Loss
+        # ---------------------------------------------------------
+        loss_dict = compute_energy_losses(
             pos_logits=pos_logits,
             neg_logits=neg_logits,
             neigh_pos_logits=neigh_pos_logits,
             neigh_neg_logits=neigh_neg_logits,
+            lambda_pair_rank=lambda_pair_rank,
+            lambda_bce=lambda_bce,
+            lambda_inbatch_rank=lambda_inbatch_rank,
             lambda_neighbour_rank=lambda_neighbour_rank,
             lambda_cluster=lambda_cluster,
             rank_margin=rank_margin,
@@ -252,16 +356,26 @@ def train_model(
     optimizer,
     device,
     train_steps=30,
-    lambda_neighbour_rank=0.5,
-    lambda_cluster=0.1,
-    rank_margin=0.5,
-    neighbour_margin=0.5,
+    lambda_pair_rank=0.5,
+    lambda_bce=1.0,
+    lambda_inbatch_rank=0.2,
+    lambda_neighbour_rank=0.1,
+    lambda_cluster=0.0,
+    rank_margin=1.0,
+    neighbour_margin=1.0,
     detach_neighbour_anchors=True,
-    best_ckpt_path="best_hotpot_rank_neighbour_cluster.pt",
+    best_ckpt_path="best_projection_answer_pool_bce_rank.pt",
 ):
     """
-    Full training loop for the clean proposed loss.
+    Full training loop.
+
+    This version supports contextual answer-token pooling because it passes
+    answer_mask into forward_energy(...).
+
+    The model itself decides whether to use answer_mask or fall back to
+    attention_mask.
     """
+
     best_mean_eval_auc = -1.0
     history = []
 
@@ -272,6 +386,9 @@ def train_model(
             energy_model=energy_model,
             optimizer=optimizer,
             device=device,
+            lambda_pair_rank=lambda_pair_rank,
+            lambda_bce=lambda_bce,
+            lambda_inbatch_rank=lambda_inbatch_rank,
             lambda_neighbour_rank=lambda_neighbour_rank,
             lambda_cluster=lambda_cluster,
             rank_margin=rank_margin,
@@ -300,10 +417,12 @@ def train_model(
             device,
         )
 
-        mean_eval_auc = np.nanmean([
-            trivia_metrics["energy_auc"],
-            truthfulqa_metrics["energy_auc"],
-        ])
+        mean_eval_auc = np.nanmean(
+            [
+                trivia_metrics["energy_auc"],
+                truthfulqa_metrics["energy_auc"],
+            ]
+        )
 
         saved_best = False
 
@@ -317,7 +436,10 @@ def train_model(
                     "model_state_dict": energy_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
 
-                    "loss_type": "rank_neighbour_cluster",
+                    "loss_type": "answer_pool_bce_pair_inbatch_neighbour",
+                    "lambda_pair_rank": lambda_pair_rank,
+                    "lambda_bce": lambda_bce,
+                    "lambda_inbatch_rank": lambda_inbatch_rank,
                     "lambda_neighbour_rank": lambda_neighbour_rank,
                     "lambda_cluster": lambda_cluster,
                     "rank_margin": rank_margin,
@@ -360,7 +482,9 @@ def train_model(
         print(
             f"Epoch {epoch:03d} | "
             f"Total={row['total_loss']:.4f} | "
+            f"BCE={row['bce_loss']:.4f} | "
             f"PairRank={row['pair_rank_loss']:.4f} | "
+            f"InBatchRank={row['inbatch_rank_loss']:.4f} | "
             f"NeighRank={row['neighbour_rank_loss']:.4f} | "
             f"Cluster={row['cluster_loss']:.4f} | "
             f"HotpotAUC={row['hotpot_auc']:.4f} | "
