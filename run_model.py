@@ -44,8 +44,8 @@ from src_new.evaluation import evaluate_loader, print_metrics
 
 CSV_PATH = "inputs/processed_qa_hallucination_dataset.csv"
 
-# Your previous run peaked around epoch 19, so start with 20.
-TRAIN_STEPS = 20
+ 
+TRAIN_STEPS = 30
 
 K_NEIGHBOURS = 5
 
@@ -57,15 +57,15 @@ K_NEIGHBOURS = 5
 #     + lambda_cluster * cluster
 LAMBDA_PAIR_RANK = 0.5
 LAMBDA_BCE = 1.0
-LAMBDA_INBATCH_RANK = 0.2
-LAMBDA_NEIGHBOUR_RANK = 0.1
+LAMBDA_INBATCH_RANK = 0.4
+LAMBDA_NEIGHBOUR_RANK = 0.0
 LAMBDA_CLUSTER = 0.0
 
 RANK_MARGIN = 1.0
 NEIGHBOUR_MARGIN = 1.0
 DETACH_NEIGHBOUR_ANCHORS = True
 
-# Rename so you know this checkpoint uses contextual answer-token pooling.
+ 
 BEST_CKPT_PATH = "best_answer_pool_projection_bce_pair_inbatch_neighbour.pt"
 
 # Model head settings

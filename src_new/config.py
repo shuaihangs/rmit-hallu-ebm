@@ -2,16 +2,12 @@ import torch
 
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_LENGTH = 64
-LR = 5e-4
-TRAIN_STEPS = 30
-BATCH_SIZE = 16
+MAX_LENGTH = 128
+LR = 2e-4
+TRAIN_STEPS = 20
+BATCH_SIZE = 8
 SEED = 42
 
-# Existing BCE + energy-bound objective
-ALPHA = 0.5
-M_IN = -1.0
-M_OUT = 1.0
 USE_SHORT_ANSWER_IN_TEXT = False
 
 # ============================================================
