@@ -6,17 +6,18 @@ from .model import forward_energy
 from .evaluation import evaluate_loader
 
 
+# ============================================================
+# Neighbour helpers
+# ============================================================
+
 def reshape_neighbour_logits(flat_logits, k_list):
     """
-    Convert flat neighbour logits [sum(k_i)] into mean neighbour energy per item [batch].
+    Convert flat neighbour logits [sum(k_i)] into mean neighbour energy per item [B].
 
-    Example:
-        flat_logits = energies for all neighbours in the batch flattened together
-        k_list      = number of neighbours for each original item
-
-    Returns:
-        mean_logits = [batch]
+    This is kept for optional debugging / cluster variants, but hard cross-neighbour
+    ranking mainly uses individual neighbour logits.
     """
+
     means = []
     start = 0
 
@@ -40,11 +41,91 @@ def reshape_neighbour_logits(flat_logits, k_list):
     return torch.stack(means, dim=0)
 
 
+def get_hard_neighbour_anchors(
+    flat_neigh_pos_logits,
+    flat_neigh_neg_logits,
+    k_list,
+):
+    """
+    Build hard neighbour anchors for each item.
+
+    For each training example i:
+
+        hard_pos_i = max_j E(neighbour_positive_j)
+
+    This is the hardest truthful neighbour, because it has the highest energy.
+
+        hard_neg_i = min_j E(neighbour_negative_j)
+
+    This is the hardest hallucinated neighbour, because it has the lowest energy.
+
+    Returns:
+        hard_pos_logits: [B]
+        hard_neg_logits: [B]
+        valid_mask:      [B] bool
+    """
+
+    hard_pos = []
+    hard_neg = []
+    valid = []
+
+    start = 0
+
+    for k in k_list.detach().cpu().tolist():
+        k = int(k)
+        end = start + k
+
+        if k <= 0:
+            hard_pos.append(
+                torch.zeros(
+                    (),
+                    device=flat_neigh_pos_logits.device,
+                    dtype=flat_neigh_pos_logits.dtype,
+                )
+            )
+
+            hard_neg.append(
+                torch.zeros(
+                    (),
+                    device=flat_neigh_neg_logits.device,
+                    dtype=flat_neigh_neg_logits.dtype,
+                )
+            )
+
+            valid.append(False)
+
+        else:
+            pos_chunk = flat_neigh_pos_logits[start:end]
+            neg_chunk = flat_neigh_neg_logits[start:end]
+
+            hard_pos.append(pos_chunk.max())
+            hard_neg.append(neg_chunk.min())
+            valid.append(True)
+
+        start = end
+
+    hard_pos_logits = torch.stack(hard_pos, dim=0)
+    hard_neg_logits = torch.stack(hard_neg, dim=0)
+
+    valid_mask = torch.tensor(
+        valid,
+        device=flat_neigh_pos_logits.device,
+        dtype=torch.bool,
+    )
+
+    return hard_pos_logits, hard_neg_logits, valid_mask
+
+
+# ============================================================
+# Loss
+# ============================================================
+
 def compute_energy_losses(
     pos_logits,
     neg_logits,
     neigh_pos_logits=None,
     neigh_neg_logits=None,
+    k_list=None,
     lambda_pair_rank=0.5,
     lambda_bce=1.0,
     lambda_inbatch_rank=0.2,
@@ -55,22 +136,35 @@ def compute_energy_losses(
     detach_neighbour_anchors=True,
 ):
     """
-    Improved projection-EBM objective.
+    Projection EBM objective with hard cross-neighbour ranking.
 
     Convention:
-        positive / truthful      -> label 0, lower energy/logit
-        negative / hallucinated  -> label 1, higher energy/logit
+        truthful / positive      -> label 0, lower energy
+        hallucinated / negative  -> label 1, higher energy
 
     Loss:
-        L = lambda_bce * BCE
-          + lambda_pair_rank * PairRank
-          + lambda_inbatch_rank * InBatchRank
-          + lambda_neighbour_rank * NeighbourRank
-          + lambda_cluster * Cluster
+
+        L_total =
+            lambda_bce * L_bce
+          + lambda_pair_rank * L_pair
+          + lambda_inbatch_rank * L_inbatch
+          + lambda_neighbour_rank * L_hard_neighbour
+          + lambda_cluster * L_cluster
+
+    Hard cross-neighbour ranking:
+
+        L_hard_neighbour =
+            0.5 * [
+                max(0, margin + E(pos_i) - min_j E(neigh_neg_ij))
+              + max(0, margin + max_j E(neigh_pos_ij) - E(neg_i))
+            ]
+
+    The 0.5 here is only averaging the two cross-neighbour terms.
+    The real weight is lambda_neighbour_rank in the total loss.
     """
 
     # ---------------------------------------------------------
-    # 1. BCE global calibration loss
+    # 1. BCE calibration
     # ---------------------------------------------------------
     pos_labels = torch.zeros_like(pos_logits)
     neg_labels = torch.ones_like(neg_logits)
@@ -88,16 +182,16 @@ def compute_energy_losses(
     bce_loss = 0.5 * (bce_pos + bce_neg)
 
     # ---------------------------------------------------------
-    # 2. Pair ranking loss
-    # Matched pair: E_pos should be lower than E_neg.
+    # 2. Pair ranking
+    # E_pos + margin < E_neg
     # ---------------------------------------------------------
     pair_rank_loss = F.relu(
         rank_margin + pos_logits - neg_logits
     ).mean()
 
     # ---------------------------------------------------------
-    # 3. In-batch ranking loss
-    # Every pos_logits - neg positive in the batch should be lower than every negative.
+    # 3. In-batch ranking
+    # Every positive should be lower than every negative in the batch.
     # ---------------------------------------------------------
     pos_matrix = pos_logits.unsqueeze(1)  # [B, 1]
     neg_matrix = neg_logits.unsqueeze(0)  # [1, B]
@@ -107,9 +201,15 @@ def compute_energy_losses(
     ).mean()
 
     # ---------------------------------------------------------
-    # 4. Neighbour ranking + optional cluster compactness
+    # 4. Hard cross-neighbour ranking
     # ---------------------------------------------------------
-    if neigh_pos_logits is None or neigh_neg_logits is None:
+    use_neighbours = (
+        neigh_pos_logits is not None
+        and neigh_neg_logits is not None
+        and k_list is not None
+    )
+
+    if not use_neighbours:
         neighbour_rank_loss = torch.zeros(
             (),
             device=pos_logits.device,
@@ -123,25 +223,73 @@ def compute_energy_losses(
         )
 
     else:
-        neighbour_rank_loss = F.relu(
-            neighbour_margin + neigh_pos_logits - neigh_neg_logits
-        ).mean()
-
-        if detach_neighbour_anchors:
-            pos_anchor = neigh_pos_logits.detach()
-            neg_anchor = neigh_neg_logits.detach()
-        else:
-            pos_anchor = neigh_pos_logits
-            neg_anchor = neigh_neg_logits
-
-        cluster_loss = (
-            F.smooth_l1_loss(pos_logits, pos_anchor)
-            +
-            F.smooth_l1_loss(neg_logits, neg_anchor)
+        hard_neigh_pos_logits, hard_neigh_neg_logits, valid_mask = (
+            get_hard_neighbour_anchors(
+                flat_neigh_pos_logits=neigh_pos_logits,
+                flat_neigh_neg_logits=neigh_neg_logits,
+                k_list=k_list,
+            )
         )
 
+        if valid_mask.any():
+            valid_pos_logits = pos_logits[valid_mask]
+            valid_neg_logits = neg_logits[valid_mask]
+
+            hard_neigh_pos_logits = hard_neigh_pos_logits[valid_mask]
+            hard_neigh_neg_logits = hard_neigh_neg_logits[valid_mask]
+
+            # Current truthful should be lower than hardest neighbour hallucination.
+            pos_vs_neigh_neg_loss = F.relu(
+                neighbour_margin
+                + valid_pos_logits
+                - hard_neigh_neg_logits
+            ).mean()
+
+            # Hardest neighbour truthful should be lower than current hallucination.
+            neigh_pos_vs_neg_loss = F.relu(
+                neighbour_margin
+                + hard_neigh_pos_logits
+                - valid_neg_logits
+            ).mean()
+
+            # Clean hard cross-neighbour loss.
+            # No extra internal weighting here.
+            # lambda_neighbour_rank is applied in total_loss below.
+            neighbour_rank_loss = 0.5 * (
+                pos_vs_neigh_neg_loss
+                + neigh_pos_vs_neg_loss
+            )
+
+            # Optional cluster compactness.
+            # Usually keep lambda_cluster = 0.0 first.
+            if detach_neighbour_anchors:
+                pos_anchor = hard_neigh_pos_logits.detach()
+                neg_anchor = hard_neigh_neg_logits.detach()
+            else:
+                pos_anchor = hard_neigh_pos_logits
+                neg_anchor = hard_neigh_neg_logits
+
+            cluster_loss = (
+                F.smooth_l1_loss(valid_pos_logits, pos_anchor)
+                +
+                F.smooth_l1_loss(valid_neg_logits, neg_anchor)
+            )
+
+        else:
+            neighbour_rank_loss = torch.zeros(
+                (),
+                device=pos_logits.device,
+                dtype=pos_logits.dtype,
+            )
+
+            cluster_loss = torch.zeros(
+                (),
+                device=pos_logits.device,
+                dtype=pos_logits.dtype,
+            )
+
     # ---------------------------------------------------------
-    # Total loss
+    # 5. Total objective
     # ---------------------------------------------------------
     total_loss = (
         lambda_bce * bce_loss
@@ -161,12 +309,13 @@ def compute_energy_losses(
     }
 
 
-# Backward-compatible alias.
+# Backward-compatible name.
 def compute_rank_neighbour_cluster_loss(
     pos_logits,
     neg_logits,
     neigh_pos_logits=None,
     neigh_neg_logits=None,
+    k_list=None,
     lambda_pair_rank=0.5,
     lambda_bce=1.0,
     lambda_inbatch_rank=0.2,
@@ -181,6 +330,7 @@ def compute_rank_neighbour_cluster_loss(
         neg_logits=neg_logits,
         neigh_pos_logits=neigh_pos_logits,
         neigh_neg_logits=neigh_neg_logits,
+        k_list=k_list,
         lambda_pair_rank=lambda_pair_rank,
         lambda_bce=lambda_bce,
         lambda_inbatch_rank=lambda_inbatch_rank,
@@ -191,6 +341,10 @@ def compute_rank_neighbour_cluster_loss(
         detach_neighbour_anchors=detach_neighbour_anchors,
     )
 
+
+# ============================================================
+# One epoch
+# ============================================================
 
 def train_one_epoch(
     train_loader,
@@ -211,13 +365,12 @@ def train_one_epoch(
     """
     One epoch of projection-EBM training.
 
-    Recommended starting objective:
-
-        L = 1.0 * BCE
-          + 0.5 * PairRank
-          + 0.2 * InBatchRank
-          + 0.1 * NeighbourRank
-          + 0.0 * Cluster
+    Uses:
+        BCE
+        PairRank
+        InBatchRank
+        HardCrossNeighbourRank
+        optional Cluster
     """
 
     base_model.eval()
@@ -237,9 +390,9 @@ def train_one_epoch(
     for batch in train_loader:
         optimizer.zero_grad(set_to_none=True)
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
         # Positive / truthful examples
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
         pos_out = forward_energy(
             base_model,
             energy_model,
@@ -249,9 +402,9 @@ def train_one_epoch(
             answer_mask=batch.get("pos_answer_mask", None),
         )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
         # Negative / hallucinated examples
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
         neg_out = forward_energy(
             base_model,
             energy_model,
@@ -266,10 +419,12 @@ def train_one_epoch(
 
         neigh_pos_logits = None
         neigh_neg_logits = None
+        k_list = None
 
-        # ---------------------------------------------------------
-        # Optional neighbours
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # Neighbours
+        # Only compute neighbour forward passes if they are actually used.
+        # -----------------------------------------------------
         has_neighbours = batch.get("has_neighbours", False)
 
         if torch.is_tensor(has_neighbours):
@@ -277,7 +432,15 @@ def train_one_epoch(
         else:
             has_neighbours = bool(has_neighbours)
 
-        if has_neighbours:
+        need_neighbours = (
+            has_neighbours
+            and (
+                lambda_neighbour_rank > 0.0
+                or lambda_cluster > 0.0
+            )
+        )
+
+        if need_neighbours:
             neigh_pos_out = forward_energy(
                 base_model,
                 energy_model,
@@ -296,24 +459,22 @@ def train_one_epoch(
                 answer_mask=batch.get("neigh_neg_answer_mask", None),
             )
 
-            neigh_pos_logits = reshape_neighbour_logits(
-                neigh_pos_out["energy_logit"],
-                batch["k_list"],
-            )
+            # IMPORTANT:
+            # Keep neighbour logits flat.
+            # Hard cross-neighbour ranking needs individual neighbour scores.
+            neigh_pos_logits = neigh_pos_out["energy_logit"]
+            neigh_neg_logits = neigh_neg_out["energy_logit"]
+            k_list = batch["k_list"]
 
-            neigh_neg_logits = reshape_neighbour_logits(
-                neigh_neg_out["energy_logit"],
-                batch["k_list"],
-            )
-
-        # ---------------------------------------------------------
-        # Loss
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # Compute loss
+        # -----------------------------------------------------
         loss_dict = compute_energy_losses(
             pos_logits=pos_logits,
             neg_logits=neg_logits,
             neigh_pos_logits=neigh_pos_logits,
             neigh_neg_logits=neigh_neg_logits,
+            k_list=k_list,
             lambda_pair_rank=lambda_pair_rank,
             lambda_bce=lambda_bce,
             lambda_inbatch_rank=lambda_inbatch_rank,
@@ -349,6 +510,10 @@ def train_one_epoch(
     }
 
 
+# ============================================================
+# Full training loop
+# ============================================================
+
 def train_model(
     loaders,
     base_model,
@@ -364,16 +529,14 @@ def train_model(
     rank_margin=1.0,
     neighbour_margin=1.0,
     detach_neighbour_anchors=True,
-    best_ckpt_path="best_projection_answer_pool_bce_rank.pt",
+    best_ckpt_path="best_answer_pool_hard_cross_neighbour.pt",
 ):
     """
     Full training loop.
 
-    This version supports contextual answer-token pooling because it passes
-    answer_mask into forward_energy(...).
+    Saves best checkpoint based on:
 
-    The model itself decides whether to use answer_mask or fall back to
-    attention_mask.
+        mean(TriviaQA AUC, TruthfulQA AUC)
     """
 
     best_mean_eval_auc = -1.0
@@ -436,7 +599,7 @@ def train_model(
                     "model_state_dict": energy_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
 
-                    "loss_type": "answer_pool_bce_pair_inbatch_neighbour",
+                    "loss_type": "answer_pool_bce_pair_inbatch_hard_cross_neighbour",
                     "lambda_pair_rank": lambda_pair_rank,
                     "lambda_bce": lambda_bce,
                     "lambda_inbatch_rank": lambda_inbatch_rank,
@@ -485,7 +648,7 @@ def train_model(
             f"BCE={row['bce_loss']:.4f} | "
             f"PairRank={row['pair_rank_loss']:.4f} | "
             f"InBatchRank={row['inbatch_rank_loss']:.4f} | "
-            f"NeighRank={row['neighbour_rank_loss']:.4f} | "
+            f"HardCrossNeighRank={row['neighbour_rank_loss']:.4f} | "
             f"Cluster={row['cluster_loss']:.4f} | "
             f"HotpotAUC={row['hotpot_auc']:.4f} | "
             f"TriviaAUC={row['trivia_auc']:.4f} | "

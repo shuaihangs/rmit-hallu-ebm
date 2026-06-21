@@ -14,9 +14,35 @@ from src_new.config import (
     DEVICE,
     MAX_LENGTH,
     LR,
+    TRAIN_STEPS,
     BATCH_SIZE,
     SEED,
     USE_SHORT_ANSWER_IN_TEXT,
+
+    # neighbour settings
+    K_NEIGHBOURS,
+
+    # loss weights
+    LAMBDA_BCE,
+    LAMBDA_PAIR_RANK,
+    LAMBDA_INBATCH_RANK,
+    LAMBDA_NEIGHBOUR_RANK,
+    LAMBDA_CLUSTER,
+
+    # margins
+    RANK_MARGIN,
+    NEIGHBOUR_MARGIN,
+    DETACH_NEIGHBOUR_ANCHORS,
+
+    # checkpoint
+    BEST_CKPT_PATH,
+
+    # model head settings
+    PROJ_DIM,
+    DROPOUT,
+    WEIGHT_DECAY,
+    NORMALIZE_PROJECTED_STATES,
+    USE_FEATURE_STANDARDIZATION,
 )
 
 from src_new.utils import set_seed
@@ -45,37 +71,7 @@ from src_new.evaluation import evaluate_loader, print_metrics
 CSV_PATH = "inputs/processed_qa_hallucination_dataset.csv"
 
  
-TRAIN_STEPS = 30
 
-K_NEIGHBOURS = 5
-
-# Loss:
-#   L = lambda_bce * BCE
-#     + lambda_pair_rank * pair rank
-#     + lambda_inbatch_rank * in-batch rank
-#     + lambda_neighbour_rank * neighbour rank
-#     + lambda_cluster * cluster
-LAMBDA_PAIR_RANK = 0.5
-LAMBDA_BCE = 1.0
-LAMBDA_INBATCH_RANK = 0.4
-LAMBDA_NEIGHBOUR_RANK = 0.0
-LAMBDA_CLUSTER = 0.0
-
-RANK_MARGIN = 1.0
-NEIGHBOUR_MARGIN = 1.0
-DETACH_NEIGHBOUR_ANCHORS = True
-
- 
-BEST_CKPT_PATH = "best_answer_pool_projection_bce_pair_inbatch_neighbour.pt"
-
-# Model head settings
-PROJ_DIM = 64
-DROPOUT = 0.3
-WEIGHT_DECAY = 1e-3
-
-# For this ablation, keep this False first.
-NORMALIZE_PROJECTED_STATES = False
-USE_FEATURE_STANDARDIZATION = False
 
 
 def main():
