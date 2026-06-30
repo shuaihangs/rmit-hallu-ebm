@@ -70,8 +70,24 @@ from src_new.evaluation import evaluate_loader, print_metrics
 
 CSV_PATH = "inputs/processed_qa_hallucination_dataset.csv"
 
- 
+# Main experiment:
+#   Train on TriviaQA
+#   Evaluate on HotpotQA and TruthfulQA
 
+TRAIN_DATASET = "trivia"
+
+EVAL_DATASETS = (
+    "trivia",      # held-out TriviaQA, needed by old train_model
+    "hotpot",      # HotpotQA evaluation
+    "truthfulqa",  # TruthfulQA evaluation
+)
+
+FINAL_EVAL_LOADER_NAMES = [
+    "hotpot_eval",
+    "truthfulqa",
+]
+
+HISTORY_PATH = "history_train_trivia_eval_hotpot_truthfulqa.csv"
 
 
 def main():
@@ -102,6 +118,9 @@ def main():
     print(f"NORMALIZE_PROJECTED_STATES: {NORMALIZE_PROJECTED_STATES}")
     print(f"USE_FEATURE_STANDARDIZATION: {USE_FEATURE_STANDARDIZATION}")
     print(f"BEST_CKPT_PATH: {BEST_CKPT_PATH}")
+    print(f"TRAIN_DATASET: {TRAIN_DATASET}")
+    print(f"EVAL_DATASETS: {EVAL_DATASETS}")
+    print(f"FINAL_EVAL_LOADER_NAMES: {FINAL_EVAL_LOADER_NAMES}")
     print("==============================================")
 
     set_seed(SEED)
@@ -117,11 +136,19 @@ def main():
     # -----------------------------------------------------------------
     print("\nLoading rows from CSV...")
     rows = load_rows_from_csv(CSV_PATH)
-    splits = split_examples_by_dataset(rows)
+
+    splits = split_examples_by_dataset(
+        rows=rows,
+        train_dataset=TRAIN_DATASET,
+        eval_datasets=EVAL_DATASETS,
+        train_eval_ratio=0.2,
+        seed=SEED,
+    )
 
     print_dataset_counts(
         rows=splits["rows"],
         examples=splits["examples"],
+        splits=splits,
     )
 
     validate_required_splits(splits)
@@ -185,13 +212,34 @@ def main():
         tokenizer=tokenizer,
         max_length=MAX_LENGTH,
         batch_size=BATCH_SIZE,
+        eval_batch_size=BATCH_SIZE,
         use_short_answer=USE_SHORT_ANSWER_IN_TEXT,
         num_workers=0,
         k_neighbours=K_NEIGHBOURS,
     )
 
+    print("\nAvailable dataloaders:")
+    for name in loaders.keys():
+        print(f"  - {name}")
+
+    # These are required by your current hard-coded train_model.
+    required_internal_loaders = [
+        "train",
+        "hotpot_eval",
+        "trivia",
+        "truthfulqa",
+    ]
+
+    for loader_name in required_internal_loaders:
+        if loader_name not in loaders:
+            raise KeyError(
+                f"Required loader '{loader_name}' not found. "
+                f"Available loaders are: {list(loaders.keys())}"
+            )
+
     # Quick sanity check: make sure answer_mask exists.
     sanity_batch = next(iter(loaders["train"]))
+
     required_keys = [
         "pos_answer_mask",
         "neg_answer_mask",
@@ -204,7 +252,7 @@ def main():
                 "Your data.py is not returning answer masks correctly."
             )
 
-    print("Answer-mask sanity check passed.")
+    print("\nAnswer-mask sanity check passed.")
     print(f"pos_answer_mask shape: {sanity_batch['pos_answer_mask'].shape}")
     print(f"neg_answer_mask shape: {sanity_batch['neg_answer_mask'].shape}")
     print(
@@ -269,30 +317,30 @@ def main():
     # -----------------------------------------------------------------
     print("\nFinal evaluation using BEST checkpoint:")
 
-    hotpot_metrics = evaluate_loader(
-        loaders["hotpot_eval"],
-        base_model,
-        energy_model,
-        DEVICE,
-    )
+    final_metrics = {}
 
-    trivia_metrics = evaluate_loader(
-        loaders["trivia"],
-        base_model,
-        energy_model,
-        DEVICE,
-    )
+    pretty_names = {
+        "hotpot_eval": "HotpotQA",
+        "trivia": "TriviaQA Heldout",
+        "truthfulqa": "TruthfulQA",
+    }
 
-    truthfulqa_metrics = evaluate_loader(
-        loaders["truthfulqa"],
-        base_model,
-        energy_model,
-        DEVICE,
-    )
+    for loader_name in FINAL_EVAL_LOADER_NAMES:
+        if loader_name not in loaders:
+            raise KeyError(
+                f"Final eval loader '{loader_name}' not found. "
+                f"Available loaders are: {list(loaders.keys())}"
+            )
 
-    print_metrics("HotpotQA", hotpot_metrics)
-    print_metrics("TriviaQA", trivia_metrics)
-    print_metrics("TruthfulQA", truthfulqa_metrics)
+        metrics = evaluate_loader(
+            loaders[loader_name],
+            base_model,
+            energy_model,
+            DEVICE,
+        )
+
+        final_metrics[loader_name] = metrics
+        print_metrics(pretty_names.get(loader_name, loader_name), metrics)
 
     # -----------------------------------------------------------------
     # Save training history
@@ -300,9 +348,8 @@ def main():
     try:
         import pandas as pd
 
-        hist_path = "history_answer_pool_projection_bce_pair_inbatch_neighbour.csv"
-        pd.DataFrame(history).to_csv(hist_path, index=False)
-        print(f"\nSaved history to: {hist_path}")
+        pd.DataFrame(history).to_csv(HISTORY_PATH, index=False)
+        print(f"\nSaved history to: {HISTORY_PATH}")
 
     except Exception as e:
         print(f"\nCould not save history CSV: {e}")

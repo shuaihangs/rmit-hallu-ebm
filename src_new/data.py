@@ -1,6 +1,6 @@
 import csv
 import random
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -42,6 +42,10 @@ def load_rows_from_csv(csv_path: str) -> List[Dict[str, Any]]:
     return rows
 
 
+# ---------------------------------------------------------------------
+# Dataset name matching
+# ---------------------------------------------------------------------
+
 def _is_hotpot(dataset_name: str) -> bool:
     return "hotpot" in dataset_name.lower()
 
@@ -53,6 +57,61 @@ def _is_trivia(dataset_name: str) -> bool:
 def _is_truthfulqa(dataset_name: str) -> bool:
     return "truthful" in dataset_name.lower()
 
+
+DATASET_MATCHERS = {
+    "hotpot": _is_hotpot,
+    "trivia": _is_trivia,
+    "truthfulqa": _is_truthfulqa,
+}
+
+
+def canonical_dataset_name(dataset_name: str):
+    """
+    Convert raw dataset name from CSV into one of:
+        hotpot, trivia, truthfulqa
+
+    Returns None if not recognised.
+    """
+
+    for canonical_name, matcher in DATASET_MATCHERS.items():
+        if matcher(dataset_name):
+            return canonical_name
+
+    return None
+
+
+def group_rows_by_dataset(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped = {name: [] for name in DATASET_MATCHERS.keys()}
+
+    for row in rows:
+        name = canonical_dataset_name(row["dataset"])
+
+        if name is not None:
+            grouped[name].append(row)
+
+    return grouped
+
+
+def _loader_key(dataset_name: str) -> str:
+    """
+    Keeps your existing naming style.
+
+    hotpot -> hotpot_eval
+    trivia -> trivia
+    truthfulqa -> truthfulqa
+    """
+
+    dataset_name = dataset_name.lower()
+
+    if dataset_name == "hotpot":
+        return "hotpot_eval"
+
+    return dataset_name
+
+
+# ---------------------------------------------------------------------
+# Convert paired rows into individual examples
+# ---------------------------------------------------------------------
 
 def rows_to_claim_examples(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     examples = []
@@ -85,54 +144,141 @@ def rows_to_claim_examples(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return examples
 
 
+# ---------------------------------------------------------------------
+# Flexible splitting
+# ---------------------------------------------------------------------
+
 def split_examples_by_dataset(
     rows: List[Dict[str, Any]],
-    hotpot_eval_ratio: float = 0.2,
+    train_dataset: str = "trivia",
+    eval_datasets: Tuple[str, ...] = ("hotpot", "truthfulqa"),
+    train_eval_ratio: float = 0.2,
     seed: int = 42,
 ):
-    hotpot_rows = [r for r in rows if _is_hotpot(r["dataset"])]
-    trivia_rows = [r for r in rows if _is_trivia(r["dataset"])]
-    truthfulqa_rows = [r for r in rows if _is_truthfulqa(r["dataset"])]
+    """
+    Flexible splitter.
+
+    Default behaviour:
+        Train on TriviaQA
+        Evaluate on HotpotQA and TruthfulQA
+
+    Example 1:
+        Train TriviaQA, evaluate HotpotQA + TruthfulQA
+
+        split_examples_by_dataset(
+            rows,
+            train_dataset="trivia",
+            eval_datasets=("hotpot", "truthfulqa"),
+        )
+
+    Example 2:
+        Train HotpotQA, evaluate TriviaQA + TruthfulQA
+
+        split_examples_by_dataset(
+            rows,
+            train_dataset="hotpot",
+            eval_datasets=("trivia", "truthfulqa"),
+        )
+
+    Example 3:
+        Train HotpotQA, evaluate held-out HotpotQA + TriviaQA + TruthfulQA
+
+        split_examples_by_dataset(
+            rows,
+            train_dataset="hotpot",
+            eval_datasets=("hotpot", "trivia", "truthfulqa"),
+            train_eval_ratio=0.2,
+        )
+    """
+
+    train_dataset = train_dataset.lower()
+    eval_datasets = tuple(x.lower() for x in eval_datasets)
+
+    if train_dataset not in DATASET_MATCHERS:
+        raise ValueError(
+            f"Unknown train_dataset='{train_dataset}'. "
+            f"Choose from {list(DATASET_MATCHERS.keys())}."
+        )
+
+    for name in eval_datasets:
+        if name not in DATASET_MATCHERS:
+            raise ValueError(
+                f"Unknown eval dataset='{name}'. "
+                f"Choose from {list(DATASET_MATCHERS.keys())}."
+            )
+
+    grouped = group_rows_by_dataset(rows)
 
     rng = random.Random(seed)
-    hotpot_rows = list(hotpot_rows)
-    rng.shuffle(hotpot_rows)
 
-    n_eval = max(1, int(len(hotpot_rows) * hotpot_eval_ratio))
-    hotpot_eval_rows = hotpot_rows[:n_eval]
-    hotpot_train_rows = hotpot_rows[n_eval:]
+    train_rows_all = list(grouped[train_dataset])
+    rng.shuffle(train_rows_all)
 
-    if len(hotpot_train_rows) == 0:
-        hotpot_train_rows = hotpot_rows
-        hotpot_eval_rows = hotpot_rows
+    if len(train_rows_all) == 0:
+        raise ValueError(
+            f"No rows found for train_dataset='{train_dataset}'. "
+            "Check the dataset column in your CSV."
+        )
 
-    hotpot_eval_examples = rows_to_claim_examples(hotpot_eval_rows)
-    trivia_examples = rows_to_claim_examples(trivia_rows)
-    truthfulqa_examples = rows_to_claim_examples(truthfulqa_rows)
+    # If the training dataset is also an eval dataset, create held-out eval split.
+    # If not, use all training rows for training.
+    if train_dataset in eval_datasets and train_eval_ratio > 0:
+        n_eval = max(1, int(len(train_rows_all) * train_eval_ratio))
 
-    all_examples = (
-        rows_to_claim_examples(hotpot_train_rows)
-        + hotpot_eval_examples
-        + trivia_examples
-        + truthfulqa_examples
-    )
+        train_eval_rows = train_rows_all[:n_eval]
+        train_rows = train_rows_all[n_eval:]
 
-    return {
+        if len(train_rows) == 0:
+            train_rows = train_rows_all
+            train_eval_rows = train_rows_all
+    else:
+        train_rows = train_rows_all
+        train_eval_rows = []
+
+    eval_examples = {}
+    eval_rows_by_name = {}
+
+    for name in eval_datasets:
+        if name == train_dataset:
+            eval_rows = train_eval_rows
+        else:
+            eval_rows = grouped[name]
+
+        loader_name = _loader_key(name)
+        eval_rows_by_name[loader_name] = eval_rows
+        eval_examples[loader_name] = rows_to_claim_examples(eval_rows)
+
+    all_examples = rows_to_claim_examples(train_rows)
+
+    for examples in eval_examples.values():
+        all_examples.extend(examples)
+
+    splits = {
         "rows": rows,
         "examples": all_examples,
 
-        "hotpot_rows": hotpot_train_rows,
-        "hotpot_eval_rows": hotpot_eval_rows,
-        "trivia_rows": trivia_rows,
-        "truthfulqa_rows": truthfulqa_rows,
+        "train_dataset": train_dataset,
+        "train_rows": train_rows,
+        "train_eval_rows": train_eval_rows,
 
-        "hotpot_examples": hotpot_eval_examples,
-        "trivia_examples": trivia_examples,
-        "truthfulqa_examples": truthfulqa_examples,
+        "eval_datasets": eval_datasets,
+        "eval_examples": eval_examples,
+        "eval_rows_by_name": eval_rows_by_name,
+
+        # Backward-compatible fields
+        "hotpot_rows": grouped["hotpot"],
+        "trivia_rows": grouped["trivia"],
+        "truthfulqa_rows": grouped["truthfulqa"],
+
+        "hotpot_examples": rows_to_claim_examples(grouped["hotpot"]),
+        "trivia_examples": rows_to_claim_examples(grouped["trivia"]),
+        "truthfulqa_examples": rows_to_claim_examples(grouped["truthfulqa"]),
     }
 
+    return splits
 
-def print_dataset_counts(rows, examples):
+
+def print_dataset_counts(rows, examples=None, splits=None):
     print("\nDataset row counts")
     print("------------------")
 
@@ -146,27 +292,39 @@ def print_dataset_counts(rows, examples):
         print(f"{name}: rows={count}")
 
     print(f"Total rows: {len(rows)}")
-    print(f"Total individual examples: {len(examples)}")
+
+    if examples is not None:
+        print(f"Total individual examples: {len(examples)}")
+
+    if splits is not None:
+        print("\nTraining split")
+        print("--------------")
+        print(f"Train dataset: {splits['train_dataset']}")
+        print(f"Train rows: {len(splits['train_rows'])}")
+        print(f"Train individual examples: {len(rows_to_claim_examples(splits['train_rows']))}")
+
+        print("\nEvaluation splits")
+        print("-----------------")
+        for loader_name, eval_examples in splits["eval_examples"].items():
+            eval_rows = splits["eval_rows_by_name"][loader_name]
+            print(
+                f"{loader_name}: rows={len(eval_rows)}, "
+                f"individual examples={len(eval_examples)}"
+            )
 
 
 def validate_required_splits(splits):
-    if len(splits["hotpot_rows"]) == 0:
+    if len(splits["train_rows"]) == 0:
         raise ValueError(
-            "No HotpotQA rows found for training. "
-            "Check CSV dataset column contains 'hotpotqa'."
+            f"No training rows found for train_dataset='{splits['train_dataset']}'."
         )
 
-    if len(splits["trivia_examples"]) == 0:
-        raise ValueError(
-            "No TriviaQA examples found for evaluation. "
-            "Check CSV dataset column contains 'triviaqa'."
-        )
-
-    if len(splits["truthfulqa_examples"]) == 0:
-        raise ValueError(
-            "No TruthfulQA examples found for evaluation. "
-            "Check CSV dataset column contains 'truthfulqa'."
-        )
+    for loader_name, examples in splits["eval_examples"].items():
+        if len(examples) == 0:
+            raise ValueError(
+                f"No evaluation examples found for loader='{loader_name}'. "
+                "Check your CSV dataset column."
+            )
 
 
 # ---------------------------------------------------------------------
@@ -200,7 +358,7 @@ def _split_prompt_and_answer_from_text(text: str):
         prompt part: question / known answer / marker
         answer part: claim text
 
-    We support both:
+    Supports:
         Question: ...\nClaim: ...
         Question: ...\nAnswer: ...
     """
@@ -216,8 +374,6 @@ def _split_prompt_and_answer_from_text(text: str):
             answer = text[marker_end:]
             return prompt, answer
 
-    # Fallback:
-    # if no marker is found, treat the whole text as answer.
     return "", text
 
 
@@ -232,15 +388,10 @@ def encode_text_with_answer_mask(
     answer_mask:
         0 = question / prompt / padding
         1 = answer / claim tokens
-
-    Important:
-        The model still sees the whole text.
-        We only use answer_mask to pool hidden states over answer tokens.
     """
 
     prompt, answer = _split_prompt_and_answer_from_text(text)
 
-    # Preserve leading space before the claim if needed.
     if answer and not answer.startswith(" "):
         answer = " " + answer
 
@@ -256,7 +407,6 @@ def encode_text_with_answer_mask(
         truncation=False,
     )["input_ids"]
 
-    # If answer is empty for any reason, fall back to masking the full text later.
     if len(answer_ids) == 0:
         full = tokenizer(
             text,
@@ -583,7 +733,7 @@ def make_claim_collate_fn(tokenizer, max_length):
 
 
 # ---------------------------------------------------------------------
-# Dataloaders
+# Flexible dataloaders
 # ---------------------------------------------------------------------
 
 def build_dataloaders(
@@ -591,69 +741,49 @@ def build_dataloaders(
     tokenizer,
     max_length=128,
     batch_size=16,
+    eval_batch_size=None,
     use_short_answer=False,
     num_workers=0,
     k_neighbours=5,
 ):
+    if eval_batch_size is None:
+        eval_batch_size = batch_size
+
     pair_collate_fn = make_pair_collate_fn(tokenizer, max_length)
     claim_collate_fn = make_claim_collate_fn(tokenizer, max_length)
 
     train_ds = PairClaimDataset(
-        splits["hotpot_rows"],
+        splits["train_rows"],
         tokenizer,
         max_length,
         use_short_answer=use_short_answer,
         k_neighbours=k_neighbours,
     )
 
-    hotpot_eval_ds = ClaimDataset(
-        splits["hotpot_examples"],
-        tokenizer,
-        max_length,
-        use_short_answer,
-    )
-
-    trivia_ds = ClaimDataset(
-        splits["trivia_examples"],
-        tokenizer,
-        max_length,
-        use_short_answer,
-    )
-
-    truthfulqa_ds = ClaimDataset(
-        splits["truthfulqa_examples"],
-        tokenizer,
-        max_length,
-        use_short_answer,
-    )
-
-    return {
+    loaders = {
         "train": DataLoader(
             train_ds,
             batch_size=batch_size,
             shuffle=True,
             collate_fn=pair_collate_fn,
             num_workers=num_workers,
-        ),
-        "hotpot_eval": DataLoader(
-            hotpot_eval_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=claim_collate_fn,
-            num_workers=num_workers,
-        ),
-        "trivia": DataLoader(
-            trivia_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=claim_collate_fn,
-            num_workers=num_workers,
-        ),
-        "truthfulqa": DataLoader(
-            truthfulqa_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=claim_collate_fn,
-            num_workers=num_workers,
-        ),
+        )
     }
+
+    for loader_name, examples in splits["eval_examples"].items():
+        eval_ds = ClaimDataset(
+            examples,
+            tokenizer,
+            max_length,
+            use_short_answer=use_short_answer,
+        )
+
+        loaders[loader_name] = DataLoader(
+            eval_ds,
+            batch_size=eval_batch_size,
+            shuffle=False,
+            collate_fn=claim_collate_fn,
+            num_workers=num_workers,
+        )
+
+    return loaders

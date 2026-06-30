@@ -4,8 +4,8 @@ import torch
 # Base model
 # ============================================================
 
-#MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
-MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+#MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
 #MODEL_NAME = "microsoft/Phi-3.5-mini-instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
