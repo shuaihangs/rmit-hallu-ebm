@@ -6,41 +6,6 @@ from .model import forward_energy
 from .evaluation import evaluate_loader
 
 
-# ============================================================
-# Neighbour helpers
-# ============================================================
-
-def reshape_neighbour_logits(flat_logits, k_list):
-    """
-    Convert flat neighbour logits [sum(k_i)] into mean neighbour energy per item [B].
-
-    This is kept for optional debugging / cluster variants, but hard cross-neighbour
-    ranking mainly uses individual neighbour logits.
-    """
-
-    means = []
-    start = 0
-
-    for k in k_list.detach().cpu().tolist():
-        k = int(k)
-        end = start + k
-
-        if k <= 0:
-            means.append(
-                torch.zeros(
-                    (),
-                    device=flat_logits.device,
-                    dtype=flat_logits.dtype,
-                )
-            )
-        else:
-            means.append(flat_logits[start:end].mean())
-
-        start = end
-
-    return torch.stack(means, dim=0)
-
-
 def get_hard_neighbour_anchors(
     flat_neigh_pos_logits,
     flat_neigh_neg_logits,
@@ -130,10 +95,8 @@ def compute_energy_losses(
     lambda_bce=1.0,
     lambda_inbatch_rank=0.2,
     lambda_neighbour_rank=0.1,
-    lambda_cluster=0.0,
     rank_margin=1.0,
     neighbour_margin=1.0,
-    detach_neighbour_anchors=True,
 ):
     """
     Projection EBM objective with hard cross-neighbour ranking.
@@ -149,7 +112,6 @@ def compute_energy_losses(
           + lambda_pair_rank * L_pair
           + lambda_inbatch_rank * L_inbatch
           + lambda_neighbour_rank * L_hard_neighbour
-          + lambda_cluster * L_cluster
 
     Hard cross-neighbour ranking:
 
@@ -216,12 +178,6 @@ def compute_energy_losses(
             dtype=pos_logits.dtype,
         )
 
-        cluster_loss = torch.zeros(
-            (),
-            device=pos_logits.device,
-            dtype=pos_logits.dtype,
-        )
-
     else:
         hard_neigh_pos_logits, hard_neigh_neg_logits, valid_mask = (
             get_hard_neighbour_anchors(
@@ -260,29 +216,8 @@ def compute_energy_losses(
                 + neigh_pos_vs_neg_loss
             )
 
-            # Optional cluster compactness.
-            # Usually keep lambda_cluster = 0.0 first.
-            if detach_neighbour_anchors:
-                pos_anchor = hard_neigh_pos_logits.detach()
-                neg_anchor = hard_neigh_neg_logits.detach()
-            else:
-                pos_anchor = hard_neigh_pos_logits
-                neg_anchor = hard_neigh_neg_logits
-
-            cluster_loss = (
-                F.smooth_l1_loss(valid_pos_logits, pos_anchor)
-                +
-                F.smooth_l1_loss(valid_neg_logits, neg_anchor)
-            )
-
         else:
             neighbour_rank_loss = torch.zeros(
-                (),
-                device=pos_logits.device,
-                dtype=pos_logits.dtype,
-            )
-
-            cluster_loss = torch.zeros(
                 (),
                 device=pos_logits.device,
                 dtype=pos_logits.dtype,
@@ -296,7 +231,6 @@ def compute_energy_losses(
         + lambda_pair_rank * pair_rank_loss
         + lambda_inbatch_rank * inbatch_rank_loss
         + lambda_neighbour_rank * neighbour_rank_loss
-        + lambda_cluster * cluster_loss
     )
 
     return {
@@ -305,41 +239,7 @@ def compute_energy_losses(
         "pair_rank_loss": pair_rank_loss,
         "inbatch_rank_loss": inbatch_rank_loss,
         "neighbour_rank_loss": neighbour_rank_loss,
-        "cluster_loss": cluster_loss,
     }
-
-
-# Backward-compatible name.
-def compute_rank_neighbour_cluster_loss(
-    pos_logits,
-    neg_logits,
-    neigh_pos_logits=None,
-    neigh_neg_logits=None,
-    k_list=None,
-    lambda_pair_rank=0.5,
-    lambda_bce=1.0,
-    lambda_inbatch_rank=0.2,
-    lambda_neighbour_rank=0.1,
-    lambda_cluster=0.0,
-    rank_margin=1.0,
-    neighbour_margin=1.0,
-    detach_neighbour_anchors=True,
-):
-    return compute_energy_losses(
-        pos_logits=pos_logits,
-        neg_logits=neg_logits,
-        neigh_pos_logits=neigh_pos_logits,
-        neigh_neg_logits=neigh_neg_logits,
-        k_list=k_list,
-        lambda_pair_rank=lambda_pair_rank,
-        lambda_bce=lambda_bce,
-        lambda_inbatch_rank=lambda_inbatch_rank,
-        lambda_neighbour_rank=lambda_neighbour_rank,
-        lambda_cluster=lambda_cluster,
-        rank_margin=rank_margin,
-        neighbour_margin=neighbour_margin,
-        detach_neighbour_anchors=detach_neighbour_anchors,
-    )
 
 
 # ============================================================
@@ -357,10 +257,8 @@ def train_one_epoch(
     lambda_bce=1.0,
     lambda_inbatch_rank=0.2,
     lambda_neighbour_rank=0.1,
-    lambda_cluster=0.0,
     rank_margin=1.0,
     neighbour_margin=1.0,
-    detach_neighbour_anchors=True,
 ):
     """
     One epoch of projection-EBM training.
@@ -370,7 +268,6 @@ def train_one_epoch(
         PairRank
         InBatchRank
         HardCrossNeighbourRank
-        optional Cluster
     """
 
     base_model.eval()
@@ -382,7 +279,6 @@ def train_one_epoch(
         "pair_rank_loss": 0.0,
         "inbatch_rank_loss": 0.0,
         "neighbour_rank_loss": 0.0,
-        "cluster_loss": 0.0,
     }
 
     seen = 0
@@ -434,10 +330,7 @@ def train_one_epoch(
 
         need_neighbours = (
             has_neighbours
-            and (
-                lambda_neighbour_rank > 0.0
-                or lambda_cluster > 0.0
-            )
+            and lambda_neighbour_rank > 0.0
         )
 
         if need_neighbours:
@@ -479,10 +372,8 @@ def train_one_epoch(
             lambda_bce=lambda_bce,
             lambda_inbatch_rank=lambda_inbatch_rank,
             lambda_neighbour_rank=lambda_neighbour_rank,
-            lambda_cluster=lambda_cluster,
             rank_margin=rank_margin,
             neighbour_margin=neighbour_margin,
-            detach_neighbour_anchors=detach_neighbour_anchors,
         )
 
         loss = loss_dict["total_loss"]
@@ -525,22 +416,37 @@ def train_model(
     lambda_bce=1.0,
     lambda_inbatch_rank=0.2,
     lambda_neighbour_rank=0.1,
-    lambda_cluster=0.0,
     rank_margin=1.0,
     neighbour_margin=1.0,
-    detach_neighbour_anchors=True,
     best_ckpt_path="best_answer_pool_hard_cross_neighbour.pt",
+    model_name=None,
+    train_dataset=None,
+    config_name=None,
+    experiment_config=None,
+    eval_datasets=None,
+    monitor_datasets=None,
+    early_stopping_patience=None,
+    early_stopping_min_delta=0.0,
 ):
     """
     Full training loop.
 
     Saves best checkpoint based on:
 
-        mean(TriviaQA AUC, TruthfulQA AUC)
+        mean evaluation AUC across the provided evaluation datasets.
     """
 
-    best_mean_eval_auc = -1.0
+    best_monitor_auc = -1.0
+    best_epoch = None
+    epochs_without_improvement = 0
     history = []
+    eval_loaders = loaders.get("eval", {})
+
+    if eval_datasets is None:
+        eval_datasets = list(eval_loaders.keys())
+
+    if monitor_datasets is None:
+        monitor_datasets = list(eval_datasets)
 
     for epoch in range(train_steps):
         train_losses = train_one_epoch(
@@ -553,44 +459,70 @@ def train_model(
             lambda_bce=lambda_bce,
             lambda_inbatch_rank=lambda_inbatch_rank,
             lambda_neighbour_rank=lambda_neighbour_rank,
-            lambda_cluster=lambda_cluster,
             rank_margin=rank_margin,
             neighbour_margin=neighbour_margin,
-            detach_neighbour_anchors=detach_neighbour_anchors,
         )
 
-        hotpot_metrics = evaluate_loader(
-            loaders["hotpot_eval"],
-            base_model,
-            energy_model,
-            device,
-        )
+        eval_metrics = {}
 
-        trivia_metrics = evaluate_loader(
-            loaders["trivia"],
-            base_model,
-            energy_model,
-            device,
-        )
+        for dataset_name in eval_datasets:
+            print(f"Evaluating {dataset_name}...", flush=True)
+            eval_metrics[dataset_name] = evaluate_loader(
+                eval_loaders[dataset_name],
+                base_model,
+                energy_model,
+                device,
+            )
+            print(
+                f"{dataset_name}: "
+                f"loss={eval_metrics[dataset_name]['loss']:.4f}, "
+                f"acc={eval_metrics[dataset_name]['accuracy']:.4f}, "
+                f"auc={eval_metrics[dataset_name]['energy_auc']:.4f}, "
+                f"logit_auc={eval_metrics[dataset_name]['logit_auc']:.4f}",
+                flush=True,
+            )
 
-        truthfulqa_metrics = evaluate_loader(
-            loaders["truthfulqa"],
-            base_model,
-            energy_model,
-            device,
-        )
+        eval_aucs = [
+            metrics["energy_auc"]
+            for metrics in eval_metrics.values()
+        ]
+        valid_eval_aucs = [
+            auc
+            for auc in eval_aucs
+            if not np.isnan(auc)
+        ]
+        monitor_aucs = [
+            eval_metrics[name]["energy_auc"]
+            for name in monitor_datasets
+            if name in eval_metrics
+            and not np.isnan(eval_metrics[name]["energy_auc"])
+        ]
 
-        mean_eval_auc = np.nanmean(
-            [
-                trivia_metrics["energy_auc"],
-                truthfulqa_metrics["energy_auc"],
-            ]
+        mean_eval_auc = (
+            float(np.mean(valid_eval_aucs))
+            if valid_eval_aucs
+            else float("nan")
         )
+        monitor_auc = (
+            float(np.mean(monitor_aucs))
+            if monitor_aucs
+            else float("nan")
+        )
+        comparable_auc = monitor_auc
+
+        if np.isnan(comparable_auc):
+            comparable_auc = -float("inf")
 
         saved_best = False
+        improved = (
+            best_epoch is None
+            or comparable_auc > best_monitor_auc + early_stopping_min_delta
+        )
 
-        if mean_eval_auc > best_mean_eval_auc:
-            best_mean_eval_auc = mean_eval_auc
+        if improved:
+            best_monitor_auc = comparable_auc
+            best_epoch = epoch
+            epochs_without_improvement = 0
             saved_best = True
 
             torch.save(
@@ -604,43 +536,55 @@ def train_model(
                     "lambda_bce": lambda_bce,
                     "lambda_inbatch_rank": lambda_inbatch_rank,
                     "lambda_neighbour_rank": lambda_neighbour_rank,
-                    "lambda_cluster": lambda_cluster,
                     "rank_margin": rank_margin,
                     "neighbour_margin": neighbour_margin,
-                    "detach_neighbour_anchors": detach_neighbour_anchors,
 
-                    "train_energy_auc": hotpot_metrics["energy_auc"],
-                    "train_accuracy": hotpot_metrics["accuracy"],
-
-                    "trivia_energy_auc": trivia_metrics["energy_auc"],
-                    "trivia_accuracy": trivia_metrics["accuracy"],
-
-                    "truthfulqa_energy_auc": truthfulqa_metrics["energy_auc"],
-                    "truthfulqa_accuracy": truthfulqa_metrics["accuracy"],
+                    "model_name": model_name,
+                    "train_dataset": train_dataset,
+                    "config_name": config_name,
+                    "experiment_config": experiment_config,
+                    "eval_datasets": list(eval_datasets),
+                    "monitor_datasets": list(monitor_datasets),
+                    "eval_metrics": eval_metrics,
 
                     "mean_eval_auc": mean_eval_auc,
+                    "monitor_auc": monitor_auc,
+                    "early_stopping_patience": early_stopping_patience,
+                    "early_stopping_min_delta": early_stopping_min_delta,
                 },
                 best_ckpt_path,
             )
+            print(f"Saved best checkpoint to {best_ckpt_path}", flush=True)
+
+        else:
+            epochs_without_improvement += 1
 
         row = {
             "epoch": epoch,
+            "model_name": model_name,
+            "train_dataset": train_dataset,
+            "config_name": config_name,
             **train_losses,
 
-            "hotpot_acc": hotpot_metrics["accuracy"],
-            "hotpot_auc": hotpot_metrics["energy_auc"],
-
-            "trivia_acc": trivia_metrics["accuracy"],
-            "trivia_auc": trivia_metrics["energy_auc"],
-
-            "truthfulqa_acc": truthfulqa_metrics["accuracy"],
-            "truthfulqa_auc": truthfulqa_metrics["energy_auc"],
-
             "mean_eval_auc": mean_eval_auc,
+            "monitor_auc": monitor_auc,
+            "best_monitor_auc": best_monitor_auc,
+            "epochs_without_improvement": epochs_without_improvement,
             "saved_best": saved_best,
         }
 
+        for dataset_name, metrics in eval_metrics.items():
+            row[f"{dataset_name}_loss"] = metrics["loss"]
+            row[f"{dataset_name}_acc"] = metrics["accuracy"]
+            row[f"{dataset_name}_auc"] = metrics["energy_auc"]
+            row[f"{dataset_name}_logit_auc"] = metrics["logit_auc"]
+
         history.append(row)
+
+        eval_text = " | ".join(
+            f"{dataset_name}AUC={row[f'{dataset_name}_auc']:.4f}"
+            for dataset_name in eval_metrics
+        )
 
         print(
             f"Epoch {epoch:03d} | "
@@ -649,12 +593,27 @@ def train_model(
             f"PairRank={row['pair_rank_loss']:.4f} | "
             f"InBatchRank={row['inbatch_rank_loss']:.4f} | "
             f"HardCrossNeighRank={row['neighbour_rank_loss']:.4f} | "
-            f"Cluster={row['cluster_loss']:.4f} | "
-            f"HotpotAUC={row['hotpot_auc']:.4f} | "
-            f"TriviaAUC={row['trivia_auc']:.4f} | "
-            f"TruthfulQAAUC={row['truthfulqa_auc']:.4f} | "
-            f"MeanEvalAUC={row['mean_eval_auc']:.4f}"
-            f"{' | saved best' if saved_best else ''}"
+            f"{eval_text} | "
+            f"MeanEvalAUC={row['mean_eval_auc']:.4f} | "
+            f"MonitorAUC={row['monitor_auc']:.4f}"
+            f"{' | saved best' if saved_best else ''}",
+            flush=True,
         )
+
+        should_stop = (
+            early_stopping_patience is not None
+            and early_stopping_patience > 0
+            and epochs_without_improvement >= early_stopping_patience
+        )
+
+        if should_stop:
+            print(
+                "Early stopping: "
+                f"no monitor AUC improvement > {early_stopping_min_delta} "
+                f"for {early_stopping_patience} epochs. "
+                f"Best epoch={best_epoch}, best monitor AUC={best_monitor_auc:.4f}.",
+                flush=True,
+            )
+            break
 
     return history

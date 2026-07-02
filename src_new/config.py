@@ -4,9 +4,14 @@ import torch
 # Base model
 # ============================================================
 
-#MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
-MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
-#MODEL_NAME = "microsoft/Phi-3.5-mini-instruct"
+MODEL_NAMES = [
+    "Qwen/Qwen2.5-3B-Instruct",
+    "meta-llama/Llama-3.2-3B-Instruct",
+    "microsoft/Phi-3.5-mini-instruct",
+]
+
+# Backward-compatible default for one-off imports.
+MODEL_NAME = MODEL_NAMES[0]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 MAX_LENGTH = 128
@@ -15,10 +20,30 @@ MAX_LENGTH = 128
 BATCH_SIZE = 8
 
 LR = 2e-4
-TRAIN_STEPS = 15
+MAX_EPOCHS = 25
+TRAIN_STEPS = MAX_EPOCHS
+EARLY_STOPPING_PATIENCE = 4
+EARLY_STOPPING_MIN_DELTA = 0.001
 SEED = 42
 
 USE_SHORT_ANSWER_IN_TEXT = False
+VALIDATION_RATIO = 0.2
+
+
+# ============================================================
+# Experiment grid
+# ============================================================
+
+CSV_PATH = "inputs/processed_qa_hallucination_dataset.csv"
+DATASET_NAMES = [
+    "hotpotqa",
+    "triviaqa",
+    "truthfulqa",
+]
+OUTPUT_DIR = "outputs"
+CHECKPOINT_DIR = "outputs/checkpoints"
+HISTORY_DIR = "outputs/histories"
+PLOT_DIR = "outputs/plots"
 
 
 # ============================================================
@@ -26,6 +51,8 @@ USE_SHORT_ANSWER_IN_TEXT = False
 # ============================================================
 
 K_NEIGHBOURS = 3
+NEIGHBOUR_BACKEND = "sentence"
+NEIGHBOUR_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 # ============================================================
@@ -38,8 +65,6 @@ LAMBDA_BCE = 1.0
 LAMBDA_PAIR_RANK = 0.3
 LAMBDA_INBATCH_RANK = 0.4
 LAMBDA_NEIGHBOUR_RANK = 0.05
-# Keep cluster off.
-LAMBDA_CLUSTER = 0.0
 
 
 # ============================================================
@@ -48,16 +73,6 @@ LAMBDA_CLUSTER = 0.0
 
 RANK_MARGIN = 1.0
 NEIGHBOUR_MARGIN = 1.0
-
-DETACH_NEIGHBOUR_ANCHORS = True
-
-
-# ============================================================
-# Checkpoint
-# ============================================================
-
-BEST_CKPT_PATH = "best_qwen_answer_pool_pair03_inbatch04_no_neighbour.pt"
-
 
 # ============================================================
 # Energy model head
@@ -69,3 +84,68 @@ WEIGHT_DECAY = 3e-3
 
 NORMALIZE_PROJECTED_STATES = False
 USE_FEATURE_STANDARDIZATION = False
+
+
+# ============================================================
+# Tuning grid
+# ============================================================
+
+# These configs are intentionally small and method-driven:
+#   - direct supervised losses should dominate retrieved-neighbour losses
+#   - same-question PairRank should be at least as strong as InBatchRank
+#   - neighbour margins should not exceed direct pair margins
+#   - no-neighbour is the required ablation for the proposed method
+TUNING_CONFIGS = [
+    {
+        "name": "no_neighbour_pair_inbatch",
+        "neighbour_backend": "none",
+        "k_neighbours": 0,
+        "lambda_bce": 1.0,
+        "lambda_pair_rank": 0.5,
+        "lambda_inbatch_rank": 0.3,
+        "lambda_neighbour_rank": 0.0,
+        "rank_margin": 1.0,
+        "neighbour_margin": 0.0,
+        "dropout": DROPOUT,
+        "weight_decay": WEIGHT_DECAY,
+    },
+    {
+        "name": "tfidf_current",
+        "neighbour_backend": "tfidf",
+        "k_neighbours": 3,
+        "lambda_bce": 1.0,
+        "lambda_pair_rank": 0.3,
+        "lambda_inbatch_rank": 0.4,
+        "lambda_neighbour_rank": 0.05,
+        "rank_margin": 1.0,
+        "neighbour_margin": 1.0,
+        "dropout": DROPOUT,
+        "weight_decay": WEIGHT_DECAY,
+    },
+    {
+        "name": "tfidf_conservative",
+        "neighbour_backend": "tfidf",
+        "k_neighbours": 3,
+        "lambda_bce": 1.0,
+        "lambda_pair_rank": 0.5,
+        "lambda_inbatch_rank": 0.3,
+        "lambda_neighbour_rank": 0.05,
+        "rank_margin": 1.0,
+        "neighbour_margin": 0.75,
+        "dropout": DROPOUT,
+        "weight_decay": WEIGHT_DECAY,
+    },
+    {
+        "name": "dense_conservative",
+        "neighbour_backend": "sentence",
+        "k_neighbours": 3,
+        "lambda_bce": 1.0,
+        "lambda_pair_rank": 0.5,
+        "lambda_inbatch_rank": 0.3,
+        "lambda_neighbour_rank": 0.05,
+        "rank_margin": 1.0,
+        "neighbour_margin": 0.75,
+        "dropout": DROPOUT,
+        "weight_decay": WEIGHT_DECAY,
+    },
+]

@@ -1,4 +1,6 @@
+import argparse
 import os
+import re
 import sys
 
 # Better to set this before importing torch / CUDA.
@@ -10,37 +12,27 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 from src_new.config import (
-    MODEL_NAME,
+    MODEL_NAMES,
     DEVICE,
     MAX_LENGTH,
     LR,
     TRAIN_STEPS,
+    EARLY_STOPPING_PATIENCE,
+    EARLY_STOPPING_MIN_DELTA,
     BATCH_SIZE,
     SEED,
     USE_SHORT_ANSWER_IN_TEXT,
+    VALIDATION_RATIO,
+    CSV_PATH,
+    DATASET_NAMES,
+    OUTPUT_DIR,
+    CHECKPOINT_DIR,
+    HISTORY_DIR,
 
-    # neighbour settings
-    K_NEIGHBOURS,
+    NEIGHBOUR_EMBEDDING_MODEL,
+    TUNING_CONFIGS,
 
-    # loss weights
-    LAMBDA_BCE,
-    LAMBDA_PAIR_RANK,
-    LAMBDA_INBATCH_RANK,
-    LAMBDA_NEIGHBOUR_RANK,
-    LAMBDA_CLUSTER,
-
-    # margins
-    RANK_MARGIN,
-    NEIGHBOUR_MARGIN,
-    DETACH_NEIGHBOUR_ANCHORS,
-
-    # checkpoint
-    BEST_CKPT_PATH,
-
-    # model head settings
     PROJ_DIM,
-    DROPOUT,
-    WEIGHT_DECAY,
     NORMALIZE_PROJECTED_STATES,
     USE_FEATURE_STANDARDIZATION,
 )
@@ -64,90 +56,188 @@ from src_new.training import train_model
 from src_new.evaluation import evaluate_loader, print_metrics
 
 
-# ---------------------------------------------------------------------
-# Training settings
-# ---------------------------------------------------------------------
-
-CSV_PATH = "inputs/processed_qa_hallucination_dataset.csv"
-
- 
+def slugify(value):
+    value = re.sub(r"[^A-Za-z0-9]+", "_", str(value)).strip("_")
+    return value.lower()
 
 
+def config_value(config, key):
+    if key not in config:
+        raise KeyError(f"Missing tuning config key: {key}")
+    return config[key]
 
-def main():
-    print("==============================================")
-    print("Projection EBM training")
-    print("Contextual answer-token pooling")
-    print("BCE + PairRank + InBatchRank + NeighbourRank")
-    print("==============================================")
-    print(f"Project root: {PROJECT_ROOT}")
-    print(f"CSV path: {CSV_PATH}")
-    print(f"MODEL_NAME: {MODEL_NAME}")
-    print(f"DEVICE: {DEVICE}")
-    print(f"TRAIN_STEPS: {TRAIN_STEPS}")
-    print(f"BATCH_SIZE: {BATCH_SIZE}")
-    print(f"MAX_LENGTH: {MAX_LENGTH}")
-    print(f"K_NEIGHBOURS: {K_NEIGHBOURS}")
-    print(f"LAMBDA_BCE: {LAMBDA_BCE}")
-    print(f"LAMBDA_PAIR_RANK: {LAMBDA_PAIR_RANK}")
-    print(f"LAMBDA_INBATCH_RANK: {LAMBDA_INBATCH_RANK}")
-    print(f"LAMBDA_NEIGHBOUR_RANK: {LAMBDA_NEIGHBOUR_RANK}")
-    print(f"LAMBDA_CLUSTER: {LAMBDA_CLUSTER}")
-    print(f"RANK_MARGIN: {RANK_MARGIN}")
-    print(f"NEIGHBOUR_MARGIN: {NEIGHBOUR_MARGIN}")
-    print(f"DETACH_NEIGHBOUR_ANCHORS: {DETACH_NEIGHBOUR_ANCHORS}")
-    print(f"PROJ_DIM: {PROJ_DIM}")
-    print(f"DROPOUT: {DROPOUT}")
-    print(f"WEIGHT_DECAY: {WEIGHT_DECAY}")
-    print(f"NORMALIZE_PROJECTED_STATES: {NORMALIZE_PROJECTED_STATES}")
-    print(f"USE_FEATURE_STANDARDIZATION: {USE_FEATURE_STANDARDIZATION}")
-    print(f"BEST_CKPT_PATH: {BEST_CKPT_PATH}")
-    print("==============================================")
 
+def config_slug(config):
+    return slugify(config_value(config, "name"))
+
+
+def checkpoint_path(config, model_name, train_dataset):
+    return os.path.join(
+        CHECKPOINT_DIR,
+        f"best_{config_slug(config)}_{slugify(model_name)}_train_{slugify(train_dataset)}.pt",
+    )
+
+
+def history_path(config, model_name, train_dataset):
+    return os.path.join(
+        HISTORY_DIR,
+        f"history_{config_slug(config)}_{slugify(model_name)}_train_{slugify(train_dataset)}.csv",
+    )
+
+
+def ensure_output_dirs():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+
+
+def configure_determinism():
     set_seed(SEED)
-
     torch.use_deterministic_algorithms(True, warn_only=True)
 
     if torch.backends.cudnn.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-    # -----------------------------------------------------------------
-    # Load data
-    # -----------------------------------------------------------------
-    print("\nLoading rows from CSV...")
-    rows = load_rows_from_csv(CSV_PATH)
-    splits = split_examples_by_dataset(rows)
 
-    print_dataset_counts(
-        rows=splits["rows"],
-        examples=splits["examples"],
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run projection-EBM tuning experiments."
     )
-
-    validate_required_splits(splits)
-
-    # -----------------------------------------------------------------
-    # Load frozen base LM
-    # -----------------------------------------------------------------
-    print("\nLoading frozen base LM...")
-    tokenizer, base_model = load_frozen_lm(MODEL_NAME, DEVICE)
-    base_model.eval()
-
-    # -----------------------------------------------------------------
-    # Build contextual-answer-pooling EBM
-    # -----------------------------------------------------------------
-    print("\nBuilding projection EBM...")
-    set_seed(SEED)
-
-    energy_model = build_energy_model(
-        base_model=base_model,
-        device=DEVICE,
-        proj_dim=PROJ_DIM,
-        dropout=DROPOUT,
-        normalize_projected_states=NORMALIZE_PROJECTED_STATES,
-        use_feature_standardization=USE_FEATURE_STANDARDIZATION,
+    parser.add_argument(
+        "--models",
+        nargs="*",
+        default=None,
+        help="Optional model names or slugs to run.",
     )
+    parser.add_argument(
+        "--train-datasets",
+        nargs="*",
+        default=None,
+        help="Optional train dataset names to run.",
+    )
+    parser.add_argument(
+        "--configs",
+        nargs="*",
+        default=None,
+        help="Optional tuning config names/slugs to run.",
+    )
+    parser.add_argument(
+        "--max-epochs",
+        type=int,
+        default=TRAIN_STEPS,
+        help="Maximum epochs per run.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=EARLY_STOPPING_PATIENCE,
+        help="Early stopping patience measured on source validation AUC.",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=EARLY_STOPPING_MIN_DELTA,
+        help="Minimum source validation AUC gain that resets patience.",
+    )
+    return parser.parse_args()
 
+
+def matches_requested(value, requested_values):
+    if requested_values is None:
+        return True
+
+    requested = {str(x) for x in requested_values}
+    requested_slugs = {slugify(x) for x in requested_values}
+    return value in requested or slugify(value) in requested_slugs
+
+
+def select_models(requested):
+    return [
+        model_name
+        for model_name in MODEL_NAMES
+        if matches_requested(model_name, requested)
+    ]
+
+
+def select_datasets(requested):
+    return [
+        dataset_name
+        for dataset_name in DATASET_NAMES
+        if matches_requested(dataset_name, requested)
+    ]
+
+
+def select_configs(requested):
+    return [
+        config
+        for config in TUNING_CONFIGS
+        if matches_requested(config_value(config, "name"), requested)
+    ]
+
+
+def print_run_settings(models, train_datasets, configs, args):
+    print("==============================================")
+    print("Projection EBM tuning experiments")
+    print("Contextual answer-token pooling")
+    print("BCE + PairRank + InBatchRank + NeighbourRank")
+    print("==============================================")
+    print(f"Project root: {PROJECT_ROOT}")
+    print(f"CSV path: {CSV_PATH}")
+    print(f"MODEL_NAMES: {models}")
+    print(f"DATASET_NAMES: {DATASET_NAMES}")
+    print(f"TRAIN_DATASETS: {train_datasets}")
+    print(f"TUNING_CONFIGS: {[c['name'] for c in configs]}")
+    print(f"DEVICE: {DEVICE}")
+    print(f"MAX_EPOCHS: {args.max_epochs}")
+    print(f"EARLY_STOPPING_PATIENCE: {args.patience}")
+    print(f"EARLY_STOPPING_MIN_DELTA: {args.min_delta}")
+    print(f"BATCH_SIZE: {BATCH_SIZE}")
+    print(f"MAX_LENGTH: {MAX_LENGTH}")
+    print(f"VALIDATION_RATIO: {VALIDATION_RATIO}")
+    print(f"NEIGHBOUR_EMBEDDING_MODEL: {NEIGHBOUR_EMBEDDING_MODEL}")
+    print(f"PROJ_DIM: {PROJ_DIM}")
+    print(f"NORMALIZE_PROJECTED_STATES: {NORMALIZE_PROJECTED_STATES}")
+    print(f"USE_FEATURE_STANDARDIZATION: {USE_FEATURE_STANDARDIZATION}")
+    print(f"OUTPUT_DIR: {OUTPUT_DIR}")
+    print(f"CHECKPOINT_DIR: {CHECKPOINT_DIR}")
+    print(f"HISTORY_DIR: {HISTORY_DIR}")
+    print("==============================================")
+
+    print("\nTuning configs")
+    print("--------------")
+    for config in configs:
+        print(
+            f"{config['name']}: "
+            f"backend={config['neighbour_backend']}, "
+            f"k={config['k_neighbours']}, "
+            f"bce={config['lambda_bce']}, "
+            f"pair={config['lambda_pair_rank']}, "
+            f"inbatch={config['lambda_inbatch_rank']}, "
+            f"neighbour={config['lambda_neighbour_rank']}, "
+            f"rank_margin={config['rank_margin']}, "
+            f"neighbour_margin={config['neighbour_margin']}, "
+            f"dropout={config['dropout']}, "
+            f"weight_decay={config['weight_decay']}"
+        )
+
+
+def print_split_counts(splits):
+    print("\nConfigured dataset groups")
+    print("-------------------------")
+
+    for dataset_name in splits["dataset_names"]:
+        dataset = splits["datasets"][dataset_name]
+        print(
+            f"{dataset_name}: "
+            f"rows={len(dataset['rows'])}, "
+            f"train_rows={len(dataset['train_rows'])}, "
+            f"validation_rows={len(dataset['validation_rows'])}, "
+            f"examples={len(dataset['examples'])}"
+        )
+
+
+def print_feature_info(energy_model):
     print("\nEnergy model feature information:")
     feature_names = energy_model.get_feature_names()
 
@@ -175,22 +265,8 @@ def main():
     if len(feature_names) > 10:
         print("  ...")
 
-    # -----------------------------------------------------------------
-    # Build dataloaders
-    # -----------------------------------------------------------------
-    print("\nBuilding dataloaders with answer masks and neighbours...")
 
-    loaders = build_dataloaders(
-        splits=splits,
-        tokenizer=tokenizer,
-        max_length=MAX_LENGTH,
-        batch_size=BATCH_SIZE,
-        use_short_answer=USE_SHORT_ANSWER_IN_TEXT,
-        num_workers=0,
-        k_neighbours=K_NEIGHBOURS,
-    )
-
-    # Quick sanity check: make sure answer_mask exists.
+def sanity_check_train_loader(loaders):
     sanity_batch = next(iter(loaders["train"]))
     required_keys = [
         "pos_answer_mask",
@@ -216,98 +292,296 @@ def main():
         sanity_batch["neg_answer_mask"].sum(dim=1).float().mean().item(),
     )
 
-    # -----------------------------------------------------------------
-    # Optimizer
-    # -----------------------------------------------------------------
+
+def add_config_columns(rows, config):
+    config_columns = {
+        "config_name": config_value(config, "name"),
+        "neighbour_backend": config_value(config, "neighbour_backend"),
+        "k_neighbours": config_value(config, "k_neighbours"),
+        "lambda_bce": config_value(config, "lambda_bce"),
+        "lambda_pair_rank": config_value(config, "lambda_pair_rank"),
+        "lambda_inbatch_rank": config_value(config, "lambda_inbatch_rank"),
+        "lambda_neighbour_rank": config_value(config, "lambda_neighbour_rank"),
+        "rank_margin": config_value(config, "rank_margin"),
+        "neighbour_margin": config_value(config, "neighbour_margin"),
+        "dropout": config_value(config, "dropout"),
+        "weight_decay": config_value(config, "weight_decay"),
+    }
+
+    return [
+        {
+            **config_columns,
+            **row,
+        }
+        for row in rows
+    ]
+
+
+def save_history(history, config, model_name, train_dataset):
+    try:
+        import pandas as pd
+
+        hist_path = history_path(config, model_name, train_dataset)
+        pd.DataFrame(add_config_columns(history, config)).to_csv(
+            hist_path,
+            index=False,
+        )
+        print(f"\nSaved history to: {hist_path}")
+
+    except Exception as e:
+        print(f"\nCould not save history CSV: {e}")
+
+
+def run_dataset_experiment(
+    config,
+    model_name,
+    train_dataset,
+    tokenizer,
+    base_model,
+    splits,
+    args,
+):
+    ood_datasets = [
+        dataset_name
+        for dataset_name in DATASET_NAMES
+        if dataset_name != train_dataset
+    ]
+
+    print("\n==============================================")
+    print(f"Config: {config['name']}")
+    print(f"Base model: {model_name}")
+    print(f"Train dataset: {train_dataset}")
+    print(f"OOD eval datasets: {ood_datasets}")
+    print("==============================================")
+
+    set_seed(SEED)
+
+    print("\nBuilding projection EBM...")
+    energy_model = build_energy_model(
+        base_model=base_model,
+        device=DEVICE,
+        proj_dim=PROJ_DIM,
+        dropout=config_value(config, "dropout"),
+        normalize_projected_states=NORMALIZE_PROJECTED_STATES,
+        use_feature_standardization=USE_FEATURE_STANDARDIZATION,
+    )
+
+    print_feature_info(energy_model)
+
+    print("\nBuilding dataloaders with answer masks and neighbours...")
+    loaders = build_dataloaders(
+        splits=splits,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_datasets=ood_datasets,
+        max_length=MAX_LENGTH,
+        batch_size=BATCH_SIZE,
+        use_short_answer=USE_SHORT_ANSWER_IN_TEXT,
+        num_workers=0,
+        k_neighbours=config_value(config, "k_neighbours"),
+        neighbour_backend=config_value(config, "neighbour_backend"),
+        neighbour_embedding_model=NEIGHBOUR_EMBEDDING_MODEL,
+    )
+
+    sanity_check_train_loader(loaders)
+    print(f"Epoch eval datasets: {loaders['eval_datasets']}")
+    print(f"Checkpoint monitor datasets: {loaders['monitor_datasets']}")
+
     optimizer = torch.optim.AdamW(
         energy_model.parameters(),
         lr=LR,
-        weight_decay=WEIGHT_DECAY,
+        weight_decay=config_value(config, "weight_decay"),
     )
 
-    # -----------------------------------------------------------------
-    # Train
-    # -----------------------------------------------------------------
-    print("\nStarting training...")
+    best_ckpt_path = checkpoint_path(config, model_name, train_dataset)
 
+    print("\nStarting training...")
     history = train_model(
         loaders=loaders,
         base_model=base_model,
         energy_model=energy_model,
         optimizer=optimizer,
         device=DEVICE,
-        train_steps=TRAIN_STEPS,
-        lambda_pair_rank=LAMBDA_PAIR_RANK,
-        lambda_bce=LAMBDA_BCE,
-        lambda_inbatch_rank=LAMBDA_INBATCH_RANK,
-        lambda_neighbour_rank=LAMBDA_NEIGHBOUR_RANK,
-        lambda_cluster=LAMBDA_CLUSTER,
-        rank_margin=RANK_MARGIN,
-        neighbour_margin=NEIGHBOUR_MARGIN,
-        detach_neighbour_anchors=DETACH_NEIGHBOUR_ANCHORS,
-        best_ckpt_path=BEST_CKPT_PATH,
+        train_steps=args.max_epochs,
+        lambda_pair_rank=config_value(config, "lambda_pair_rank"),
+        lambda_bce=config_value(config, "lambda_bce"),
+        lambda_inbatch_rank=config_value(config, "lambda_inbatch_rank"),
+        lambda_neighbour_rank=config_value(config, "lambda_neighbour_rank"),
+        rank_margin=config_value(config, "rank_margin"),
+        neighbour_margin=config_value(config, "neighbour_margin"),
+        best_ckpt_path=best_ckpt_path,
+        model_name=model_name,
+        train_dataset=train_dataset,
+        config_name=config_value(config, "name"),
+        experiment_config=dict(config),
+        eval_datasets=loaders["eval_datasets"],
+        monitor_datasets=loaders["monitor_datasets"],
+        early_stopping_patience=args.patience,
+        early_stopping_min_delta=args.min_delta,
     )
 
-    # -----------------------------------------------------------------
-    # Reload best checkpoint before final evaluation
-    # -----------------------------------------------------------------
-    print("\nLoading best checkpoint before final evaluation...")
+    save_history(history, config, model_name, train_dataset)
 
+    print("\nLoading best checkpoint before final evaluation...")
     ckpt = torch.load(
-        BEST_CKPT_PATH,
+        best_ckpt_path,
         map_location=DEVICE,
     )
 
     energy_model.load_state_dict(ckpt["model_state_dict"])
     energy_model.eval()
 
-    print(f"Loaded best checkpoint from epoch: {ckpt.get('epoch', 'unknown')}")
-    print(f"Best checkpoint mean_eval_auc: {ckpt.get('mean_eval_auc', 'unknown')}")
+    best_epoch = ckpt.get("epoch", "unknown")
+    best_monitor_auc = ckpt.get("monitor_auc", "unknown")
+    best_mean_eval_auc = ckpt.get("mean_eval_auc", "unknown")
 
-    # -----------------------------------------------------------------
-    # Final evaluation using BEST model state
-    # -----------------------------------------------------------------
+    print(f"Loaded best checkpoint from epoch: {best_epoch}")
+    print(f"Best checkpoint monitor_auc: {best_monitor_auc}")
+    print(f"Best checkpoint mean_eval_auc: {best_mean_eval_auc}")
+
     print("\nFinal evaluation using BEST checkpoint:")
 
-    hotpot_metrics = evaluate_loader(
-        loaders["hotpot_eval"],
-        base_model,
-        energy_model,
-        DEVICE,
+    result_rows = []
+    stopped_epoch = history[-1]["epoch"] if history else None
+    early_stopped = bool(
+        history
+        and args.patience is not None
+        and args.patience > 0
+        and stopped_epoch is not None
+        and stopped_epoch + 1 < args.max_epochs
     )
 
-    trivia_metrics = evaluate_loader(
-        loaders["trivia"],
-        base_model,
-        energy_model,
-        DEVICE,
-    )
+    common_result = {
+        "config_name": config_value(config, "name"),
+        "model_name": model_name,
+        "train_dataset": train_dataset,
+        "checkpoint_path": best_ckpt_path,
+        "best_epoch": best_epoch,
+        "stopped_epoch": stopped_epoch,
+        "early_stopped": early_stopped,
+        "best_monitor_auc": best_monitor_auc,
+        "best_mean_eval_auc": best_mean_eval_auc,
+        "max_epochs": args.max_epochs,
+        "early_stopping_patience": args.patience,
+        "early_stopping_min_delta": args.min_delta,
+    }
+    common_result.update(add_config_columns([{}], config)[0])
 
-    truthfulqa_metrics = evaluate_loader(
-        loaders["truthfulqa"],
-        base_model,
-        energy_model,
-        DEVICE,
-    )
+    for eval_dataset in loaders["eval_datasets"]:
+        metrics = evaluate_loader(
+            loaders["eval"][eval_dataset],
+            base_model,
+            energy_model,
+            DEVICE,
+        )
 
-    print_metrics("HotpotQA", hotpot_metrics)
-    print_metrics("TriviaQA", trivia_metrics)
-    print_metrics("TruthfulQA", truthfulqa_metrics)
+        print_metrics(eval_dataset, metrics)
 
-    # -----------------------------------------------------------------
-    # Save training history
-    # -----------------------------------------------------------------
+        result_rows.append(
+            {
+                **common_result,
+                "eval_dataset": eval_dataset,
+                **metrics,
+            }
+        )
+
+    print(f"Best checkpoint path: {best_ckpt_path}")
+
+    del energy_model
+    del optimizer
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result_rows
+
+
+def save_summary(result_rows):
+    if not result_rows:
+        return
+
     try:
         import pandas as pd
 
-        hist_path = "history_answer_pool_projection_bce_pair_inbatch_neighbour.csv"
-        pd.DataFrame(history).to_csv(hist_path, index=False)
-        print(f"\nSaved history to: {hist_path}")
+        summary_path = os.path.join(OUTPUT_DIR, "experiment_summary.csv")
+        pd.DataFrame(result_rows).to_csv(summary_path, index=False)
+        print(f"\nSaved experiment summary to: {summary_path}")
 
     except Exception as e:
-        print(f"\nCould not save history CSV: {e}")
+        print(f"\nCould not save experiment summary CSV: {e}")
 
-    print(f"Best checkpoint path: {BEST_CKPT_PATH}")
+
+def main():
+    args = parse_args()
+    selected_models = select_models(args.models)
+    selected_train_datasets = select_datasets(args.train_datasets)
+    selected_configs = select_configs(args.configs)
+
+    if not selected_models:
+        raise ValueError("No matching models selected.")
+    if not selected_train_datasets:
+        raise ValueError("No matching train datasets selected.")
+    if not selected_configs:
+        raise ValueError("No matching tuning configs selected.")
+
+    print_run_settings(
+        models=selected_models,
+        train_datasets=selected_train_datasets,
+        configs=selected_configs,
+        args=args,
+    )
+    configure_determinism()
+    ensure_output_dirs()
+
+    print("\nLoading rows from CSV...")
+    rows = load_rows_from_csv(CSV_PATH)
+    splits = split_examples_by_dataset(
+        rows,
+        dataset_names=DATASET_NAMES,
+        validation_ratio=VALIDATION_RATIO,
+        seed=SEED,
+    )
+
+    print_dataset_counts(
+        rows=splits["rows"],
+        examples=splits["examples"],
+    )
+    print_split_counts(splits)
+    validate_required_splits(splits, DATASET_NAMES)
+
+    all_result_rows = []
+
+    for model_name in selected_models:
+        print("\n==============================================")
+        print(f"Loading frozen base LM: {model_name}")
+        print("==============================================")
+
+        tokenizer, base_model = load_frozen_lm(model_name, DEVICE)
+        base_model.eval()
+
+        try:
+            for config in selected_configs:
+                for train_dataset in selected_train_datasets:
+                    result_rows = run_dataset_experiment(
+                        config=config,
+                        model_name=model_name,
+                        train_dataset=train_dataset,
+                        tokenizer=tokenizer,
+                        base_model=base_model,
+                        splits=splits,
+                        args=args,
+                    )
+                    all_result_rows.extend(result_rows)
+                    save_summary(all_result_rows)
+
+        finally:
+            del base_model
+            del tokenizer
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    save_summary(all_result_rows)
     print("Done.")
 
 

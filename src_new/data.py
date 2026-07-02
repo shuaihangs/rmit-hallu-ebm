@@ -1,12 +1,15 @@
 import csv
+import hashlib
 import random
 from typing import Dict, List, Any
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from sklearn.neighbors import NearestNeighbors
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+
+_NEIGHBOUR_INDEX_CACHE = {}
 
 
 # ---------------------------------------------------------------------
@@ -42,16 +45,24 @@ def load_rows_from_csv(csv_path: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def _is_hotpot(dataset_name: str) -> bool:
-    return "hotpot" in dataset_name.lower()
+def normalize_dataset_key(dataset_name: str) -> str:
+    name = str(dataset_name).strip().lower()
+    name = name.replace("-", "_")
+    name = name.replace(" ", "_")
 
+    if "hotpot" in name:
+        return "hotpotqa"
 
-def _is_trivia(dataset_name: str) -> bool:
-    return "trivia" in dataset_name.lower()
+    if "truthful" in name:
+        return "truthfulqa"
 
+    if "halueval" in name or "halu_eval" in name or "hallu_eval" in name:
+        return "halueval"
 
-def _is_truthfulqa(dataset_name: str) -> bool:
-    return "truthful" in dataset_name.lower()
+    if "trivia" in name:
+        return "triviaqa"
+
+    return name
 
 
 def rows_to_claim_examples(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -87,48 +98,69 @@ def rows_to_claim_examples(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def split_examples_by_dataset(
     rows: List[Dict[str, Any]],
-    hotpot_eval_ratio: float = 0.2,
+    dataset_names=None,
+    validation_ratio: float = 0.2,
     seed: int = 42,
 ):
-    hotpot_rows = [r for r in rows if _is_hotpot(r["dataset"])]
-    trivia_rows = [r for r in rows if _is_trivia(r["dataset"])]
-    truthfulqa_rows = [r for r in rows if _is_truthfulqa(r["dataset"])]
+    if dataset_names is None:
+        dataset_names = sorted({
+            normalize_dataset_key(row["dataset"])
+            for row in rows
+        })
+    else:
+        dataset_names = [
+            normalize_dataset_key(name)
+            for name in dataset_names
+        ]
 
-    rng = random.Random(seed)
-    hotpot_rows = list(hotpot_rows)
-    rng.shuffle(hotpot_rows)
+    datasets = {
+        name: {
+            "rows": [],
+            "examples": [],
+        }
+        for name in dataset_names
+    }
 
-    n_eval = max(1, int(len(hotpot_rows) * hotpot_eval_ratio))
-    hotpot_eval_rows = hotpot_rows[:n_eval]
-    hotpot_train_rows = hotpot_rows[n_eval:]
+    for row in rows:
+        dataset_key = normalize_dataset_key(row["dataset"])
 
-    if len(hotpot_train_rows) == 0:
-        hotpot_train_rows = hotpot_rows
-        hotpot_eval_rows = hotpot_rows
+        if dataset_key not in datasets:
+            continue
 
-    hotpot_eval_examples = rows_to_claim_examples(hotpot_eval_rows)
-    trivia_examples = rows_to_claim_examples(trivia_rows)
-    truthfulqa_examples = rows_to_claim_examples(truthfulqa_rows)
+        datasets[dataset_key]["rows"].append(row)
 
-    all_examples = (
-        rows_to_claim_examples(hotpot_train_rows)
-        + hotpot_eval_examples
-        + trivia_examples
-        + truthfulqa_examples
-    )
+    all_examples = []
+
+    for dataset_idx, dataset in enumerate(datasets.values()):
+        dataset_rows = list(dataset["rows"])
+        rng = random.Random(seed + dataset_idx)
+        rng.shuffle(dataset_rows)
+
+        if validation_ratio > 0.0 and len(dataset_rows) > 1:
+            n_validation = max(1, int(len(dataset_rows) * validation_ratio))
+            n_validation = min(n_validation, len(dataset_rows) - 1)
+        else:
+            n_validation = 0
+
+        validation_rows = dataset_rows[:n_validation]
+        train_rows = dataset_rows[n_validation:]
+
+        if len(train_rows) == 0:
+            train_rows = dataset_rows
+            validation_rows = dataset_rows
+
+        dataset["train_rows"] = train_rows
+        dataset["validation_rows"] = validation_rows
+        dataset["examples"] = rows_to_claim_examples(dataset["rows"])
+        dataset["train_examples"] = rows_to_claim_examples(train_rows)
+        dataset["validation_examples"] = rows_to_claim_examples(validation_rows)
+        all_examples.extend(dataset["examples"])
 
     return {
         "rows": rows,
         "examples": all_examples,
-
-        "hotpot_rows": hotpot_train_rows,
-        "hotpot_eval_rows": hotpot_eval_rows,
-        "trivia_rows": trivia_rows,
-        "truthfulqa_rows": truthfulqa_rows,
-
-        "hotpot_examples": hotpot_eval_examples,
-        "trivia_examples": trivia_examples,
-        "truthfulqa_examples": truthfulqa_examples,
+        "dataset_names": dataset_names,
+        "datasets": datasets,
     }
 
 
@@ -149,23 +181,30 @@ def print_dataset_counts(rows, examples):
     print(f"Total individual examples: {len(examples)}")
 
 
-def validate_required_splits(splits):
-    if len(splits["hotpot_rows"]) == 0:
-        raise ValueError(
-            "No HotpotQA rows found for training. "
-            "Check CSV dataset column contains 'hotpotqa'."
-        )
+def validate_required_splits(splits, dataset_names=None):
+    if dataset_names is None:
+        dataset_names = splits["dataset_names"]
 
-    if len(splits["trivia_examples"]) == 0:
-        raise ValueError(
-            "No TriviaQA examples found for evaluation. "
-            "Check CSV dataset column contains 'triviaqa'."
-        )
+    dataset_names = [
+        normalize_dataset_key(name)
+        for name in dataset_names
+    ]
 
-    if len(splits["truthfulqa_examples"]) == 0:
+    missing = [
+        name
+        for name in dataset_names
+        if len(splits["datasets"].get(name, {}).get("rows", [])) == 0
+    ]
+
+    if missing:
+        available = sorted({
+            normalize_dataset_key(row["dataset"])
+            for row in splits["rows"]
+        })
         raise ValueError(
-            "No TruthfulQA examples found for evaluation. "
-            "Check CSV dataset column contains 'truthfulqa'."
+            "Missing required dataset rows for: "
+            f"{', '.join(missing)}. "
+            f"Available dataset keys in CSV: {', '.join(available)}."
         )
 
 
@@ -329,8 +368,6 @@ class ClaimDataset(Dataset):
     def __init__(
         self,
         examples,
-        tokenizer=None,
-        max_length=128,
         use_short_answer=False,
     ):
         self.examples = examples
@@ -381,16 +418,22 @@ class PairClaimDataset(Dataset):
     def __init__(
         self,
         rows,
-        tokenizer=None,
-        max_length=128,
         use_short_answer=False,
         k_neighbours=5,
+        neighbour_backend="sentence",
+        neighbour_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
     ):
         self.rows = rows
         self.use_short_answer = use_short_answer
         self.k_neighbours = k_neighbours
+        self.neighbour_backend = neighbour_backend
+        self.neighbour_embedding_model = neighbour_embedding_model
 
-        self.neighbour_indices = self._build_neighbour_indices(k_neighbours)
+        self.neighbour_indices = self._build_neighbour_indices(
+            k=k_neighbours,
+            backend=neighbour_backend,
+            embedding_model_name=neighbour_embedding_model,
+        )
 
     def __len__(self):
         return len(self.rows)
@@ -403,30 +446,125 @@ class PairClaimDataset(Dataset):
             use_short_answer=self.use_short_answer,
         )
 
-    def _build_neighbour_indices(self, k):
-        if k <= 0 or len(self.rows) <= 1:
+    def _build_neighbour_indices(
+        self,
+        k,
+        backend,
+        embedding_model_name,
+    ):
+        """
+        Build K nearest question neighbours among training questions.
+
+        Supported backends:
+            none     -> no neighbours
+            tfidf    -> sparse lexical nearest neighbours
+            sentence -> dense sentence-embedding nearest neighbours
+
+        The returned indices point into self.rows.
+        """
+        backend = str(backend or "none").strip().lower()
+
+        if backend in {"none", "off", "disabled"} or k <= 0 or len(self.rows) <= 1:
             return [[] for _ in self.rows]
 
         questions = [r["question"] for r in self.rows]
+        question_digest = hashlib.sha1(
+            "\n".join(questions).encode("utf-8")
+        ).hexdigest()
+        cache_key = (
+            backend,
+            int(k),
+            str(embedding_model_name),
+            question_digest,
+        )
 
-        try:
-            vectorizer = TfidfVectorizer(
-                lowercase=True,
-                stop_words="english",
-                max_features=50000,
+        if cache_key in _NEIGHBOUR_INDEX_CACHE:
+            print(
+                f"Using cached {backend} question neighbours "
+                f"(k={k}, rows={len(self.rows)})."
             )
-            x = vectorizer.fit_transform(questions)
-            sim = cosine_similarity(x)
-        except Exception:
-            return [[] for _ in self.rows]
+            return _NEIGHBOUR_INDEX_CACHE[cache_key]
+
+        if backend == "tfidf":
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+
+                print(
+                    f"Building TF-IDF question neighbours "
+                    f"(k={k}, rows={len(self.rows)})..."
+                )
+                vectorizer = TfidfVectorizer(
+                    lowercase=True,
+                    stop_words="english",
+                    max_features=50000,
+                )
+                features = vectorizer.fit_transform(questions)
+                n_neighbours = min(k + 1, len(self.rows))
+                index = NearestNeighbors(
+                    n_neighbors=n_neighbours,
+                    metric="cosine",
+                    algorithm="brute",
+                )
+                index.fit(features)
+                _, nearest_indices = index.kneighbors(features)
+
+            except Exception as e:
+                raise RuntimeError(
+                    "Could not build TF-IDF neighbours. "
+                    "Check scikit-learn and the input questions."
+                ) from e
+
+        elif backend in {"sentence", "embedding", "dense"}:
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                print(
+                    "Building sentence-embedding question neighbours with "
+                    f"{embedding_model_name} (k={k}, rows={len(self.rows)})..."
+                )
+
+                embedder = SentenceTransformer(embedding_model_name)
+                embeddings = embedder.encode(
+                    questions,
+                    batch_size=64,
+                    normalize_embeddings=True,
+                    show_progress_bar=True,
+                )
+
+                embeddings = np.asarray(embeddings)
+                n_neighbours = min(k + 1, len(self.rows))
+
+                index = NearestNeighbors(
+                    n_neighbors=n_neighbours,
+                    metric="cosine",
+                )
+                index.fit(embeddings)
+                _, nearest_indices = index.kneighbors(embeddings)
+
+            except Exception as e:
+                raise RuntimeError(
+                    "Could not build sentence-embedding neighbours. "
+                    "Install sentence-transformers in the active environment or "
+                    "check the embedding model name."
+                ) from e
+
+        else:
+            raise ValueError(
+                "Unknown neighbour backend: "
+                f"{backend}. Use one of: none, tfidf, sentence."
+            )
 
         neighbours = []
 
-        for i in range(len(self.rows)):
-            order = sim[i].argsort()[::-1].tolist()
-            order = [j for j in order if j != i]
-            neighbours.append(order[:k])
+        for i, row_indices in enumerate(nearest_indices):
+            row_indices = [
+                int(j)
+                for j in row_indices
+                if int(j) != i
+            ]
+            neighbours.append(row_indices[:k])
 
+        _NEIGHBOUR_INDEX_CACHE[cache_key] = neighbours
         return neighbours
 
     def __getitem__(self, idx):
@@ -589,45 +727,109 @@ def make_claim_collate_fn(tokenizer, max_length):
 def build_dataloaders(
     splits,
     tokenizer,
+    train_dataset,
+    eval_datasets=None,
     max_length=128,
     batch_size=16,
     use_short_answer=False,
     num_workers=0,
     k_neighbours=5,
+    neighbour_backend="sentence",
+    neighbour_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
 ):
+    train_dataset = normalize_dataset_key(train_dataset)
+
+    if eval_datasets is None:
+        eval_datasets = [
+            name
+            for name in splits["dataset_names"]
+            if name != train_dataset
+        ]
+    else:
+        eval_datasets = [
+            normalize_dataset_key(name)
+            for name in eval_datasets
+        ]
+
     pair_collate_fn = make_pair_collate_fn(tokenizer, max_length)
     claim_collate_fn = make_claim_collate_fn(tokenizer, max_length)
 
+    if train_dataset not in splits["datasets"]:
+        raise KeyError(f"Unknown train dataset: {train_dataset}")
+
+    train_rows = splits["datasets"][train_dataset]["rows"]
+    train_rows = splits["datasets"][train_dataset].get("train_rows", train_rows)
+
+    if len(train_rows) == 0:
+        raise ValueError(f"No rows available for train dataset: {train_dataset}")
+
     train_ds = PairClaimDataset(
-        splits["hotpot_rows"],
-        tokenizer,
-        max_length,
+        train_rows,
         use_short_answer=use_short_answer,
         k_neighbours=k_neighbours,
+        neighbour_backend=neighbour_backend,
+        neighbour_embedding_model=neighbour_embedding_model,
     )
 
-    hotpot_eval_ds = ClaimDataset(
-        splits["hotpot_examples"],
-        tokenizer,
-        max_length,
-        use_short_answer,
+    eval_loaders = {}
+    train_eval_name = f"{train_dataset}_train"
+    validation_eval_name = f"{train_dataset}_val"
+
+    train_examples = splits["datasets"][train_dataset].get(
+        "train_examples",
+        rows_to_claim_examples(train_rows),
+    )
+    validation_examples = splits["datasets"][train_dataset].get(
+        "validation_examples",
+        [],
     )
 
-    trivia_ds = ClaimDataset(
-        splits["trivia_examples"],
-        tokenizer,
-        max_length,
-        use_short_answer,
-    )
+    if len(validation_examples) == 0:
+        validation_examples = train_examples
 
-    truthfulqa_ds = ClaimDataset(
-        splits["truthfulqa_examples"],
-        tokenizer,
-        max_length,
-        use_short_answer,
-    )
+    for eval_name, eval_examples in [
+        (train_eval_name, train_examples),
+        (validation_eval_name, validation_examples),
+    ]:
+        eval_ds = ClaimDataset(
+            eval_examples,
+            use_short_answer=use_short_answer,
+        )
+
+        eval_loaders[eval_name] = DataLoader(
+            eval_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=claim_collate_fn,
+            num_workers=num_workers,
+        )
+
+    for dataset_name in eval_datasets:
+        if dataset_name not in splits["datasets"]:
+            raise KeyError(f"Unknown eval dataset: {dataset_name}")
+
+        eval_examples = splits["datasets"][dataset_name]["examples"]
+
+        if len(eval_examples) == 0:
+            raise ValueError(f"No examples available for eval dataset: {dataset_name}")
+
+        eval_ds = ClaimDataset(
+            eval_examples,
+            use_short_answer=use_short_answer,
+        )
+
+        eval_loaders[dataset_name] = DataLoader(
+            eval_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=claim_collate_fn,
+            num_workers=num_workers,
+        )
 
     return {
+        "train_dataset": train_dataset,
+        "eval_datasets": list(eval_loaders.keys()),
+        "monitor_datasets": [validation_eval_name],
         "train": DataLoader(
             train_ds,
             batch_size=batch_size,
@@ -635,25 +837,5 @@ def build_dataloaders(
             collate_fn=pair_collate_fn,
             num_workers=num_workers,
         ),
-        "hotpot_eval": DataLoader(
-            hotpot_eval_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=claim_collate_fn,
-            num_workers=num_workers,
-        ),
-        "trivia": DataLoader(
-            trivia_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=claim_collate_fn,
-            num_workers=num_workers,
-        ),
-        "truthfulqa": DataLoader(
-            truthfulqa_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=claim_collate_fn,
-            num_workers=num_workers,
-        ),
+        "eval": eval_loaders,
     }

@@ -80,7 +80,7 @@ def evaluate_loader(
         """
         Collect compact scalar diagnostics from model output.
 
-        This avoids hard-coding old features like update_mean.
+        This avoids hard-coding model-specific diagnostic names.
         """
         skip_keys = {
             "energy_logit",

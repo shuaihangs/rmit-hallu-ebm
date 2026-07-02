@@ -415,24 +415,6 @@ def build_energy_model(
     ).to(device)
 
 
-def build_energy_model_from_hidden_size(
-    hidden_size,
-    device,
-    proj_dim=128,
-    dropout=0.1,
-    normalize_projected_states=False,
-    use_feature_standardization=False,
-):
-    return LearnedClaimEnergy(
-        hidden_size=hidden_size,
-        proj_dim=proj_dim,
-        dropout=dropout,
-        normalize_projected_states=normalize_projected_states,
-        use_feature_standardization=use_feature_standardization,
-        total_num_layers=None,
-    ).to(device)
-
-
 def get_hidden_states(base_model, input_ids, attention_mask, device):
     input_ids = input_ids.to(device, non_blocking=True)
     attention_mask = attention_mask.to(device, non_blocking=True)
@@ -472,31 +454,3 @@ def forward_energy(
         attention_mask=attention_mask,
         answer_mask=answer_mask,
     )
-
-
-@torch.no_grad()
-def cached_raw_layer_reprs(
-    base_model,
-    energy_model,
-    input_ids,
-    attention_mask,
-    device,
-    answer_mask=None,
-):
-    attention_mask, hidden_states = get_hidden_states(
-        base_model,
-        input_ids,
-        attention_mask,
-        device,
-    )
-
-    if answer_mask is not None:
-        answer_mask = answer_mask.to(device, non_blocking=True)
-
-    raw_layer_reprs = energy_model.get_raw_layer_reprs(
-        hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        answer_mask=answer_mask,
-    )
-
-    return raw_layer_reprs.detach().cpu().to(torch.float16)
