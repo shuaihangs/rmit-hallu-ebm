@@ -19,15 +19,26 @@ from src_new.config import (
     TRAIN_STEPS,
     EARLY_STOPPING_PATIENCE,
     EARLY_STOPPING_MIN_DELTA,
+    EVAL_EVERY_EPOCH,
     BATCH_SIZE,
     SEED,
     USE_SHORT_ANSWER_IN_TEXT,
+    CACHE_FROZEN_LLM_FEATURES,
+    FEATURE_CACHE_DIR,
+    FEATURE_CACHE_BATCH_SIZE,
     VALIDATION_RATIO,
     CSV_PATH,
     DATASET_NAMES,
     OUTPUT_DIR,
     CHECKPOINT_DIR,
     HISTORY_DIR,
+    AUTO_LOSS_WEIGHTING,
+    AUTO_LOSS_REFERENCE,
+    AUTO_LOSS_SCALE_BATCHES,
+    AUTO_LOSS_SCALE_STATISTIC,
+    LOSS_NORMALIZATION,
+    LOSS_SCALE_EMA_DECAY,
+    LOSS_SCALE_EPS,
 
     NEIGHBOUR_EMBEDDING_MODEL,
     TUNING_CONFIGS,
@@ -192,9 +203,20 @@ def print_run_settings(models, train_datasets, configs, args):
     print(f"MAX_EPOCHS: {args.max_epochs}")
     print(f"EARLY_STOPPING_PATIENCE: {args.patience}")
     print(f"EARLY_STOPPING_MIN_DELTA: {args.min_delta}")
+    print(f"EVAL_EVERY_EPOCH: {EVAL_EVERY_EPOCH}")
+    print(f"AUTO_LOSS_WEIGHTING: {AUTO_LOSS_WEIGHTING}")
+    print(f"AUTO_LOSS_REFERENCE: {AUTO_LOSS_REFERENCE}")
+    print(f"AUTO_LOSS_SCALE_BATCHES: {AUTO_LOSS_SCALE_BATCHES}")
+    print(f"AUTO_LOSS_SCALE_STATISTIC: {AUTO_LOSS_SCALE_STATISTIC}")
+    print(f"LOSS_NORMALIZATION: {LOSS_NORMALIZATION}")
+    print(f"LOSS_SCALE_EMA_DECAY: {LOSS_SCALE_EMA_DECAY}")
+    print(f"LOSS_SCALE_EPS: {LOSS_SCALE_EPS}")
     print(f"BATCH_SIZE: {BATCH_SIZE}")
     print(f"MAX_LENGTH: {MAX_LENGTH}")
     print(f"VALIDATION_RATIO: {VALIDATION_RATIO}")
+    print(f"CACHE_FROZEN_LLM_FEATURES: {CACHE_FROZEN_LLM_FEATURES}")
+    print(f"FEATURE_CACHE_DIR: {FEATURE_CACHE_DIR}")
+    print(f"FEATURE_CACHE_BATCH_SIZE: {FEATURE_CACHE_BATCH_SIZE}")
     print(f"NEIGHBOUR_EMBEDDING_MODEL: {NEIGHBOUR_EMBEDDING_MODEL}")
     print(f"PROJ_DIM: {PROJ_DIM}")
     print(f"NORMALIZE_PROJECTED_STATES: {NORMALIZE_PROJECTED_STATES}")
@@ -211,10 +233,10 @@ def print_run_settings(models, train_datasets, configs, args):
             f"{config['name']}: "
             f"backend={config['neighbour_backend']}, "
             f"k={config['k_neighbours']}, "
-            f"bce={config['lambda_bce']}, "
-            f"pair={config['lambda_pair_rank']}, "
-            f"inbatch={config['lambda_inbatch_rank']}, "
-            f"neighbour={config['lambda_neighbour_rank']}, "
+            f"bce_gate={config['lambda_bce']}, "
+            f"pair_gate={config['lambda_pair_rank']}, "
+            f"inbatch_gate={config['lambda_inbatch_rank']}, "
+            f"neighbour_gate={config['lambda_neighbour_rank']}, "
             f"rank_margin={config['rank_margin']}, "
             f"neighbour_margin={config['neighbour_margin']}, "
             f"dropout={config['dropout']}, "
@@ -304,6 +326,13 @@ def add_config_columns(rows, config):
         "lambda_neighbour_rank": config_value(config, "lambda_neighbour_rank"),
         "rank_margin": config_value(config, "rank_margin"),
         "neighbour_margin": config_value(config, "neighbour_margin"),
+        "auto_loss_weighting": AUTO_LOSS_WEIGHTING,
+        "auto_loss_reference": AUTO_LOSS_REFERENCE,
+        "auto_loss_scale_batches": AUTO_LOSS_SCALE_BATCHES,
+        "auto_loss_scale_statistic": AUTO_LOSS_SCALE_STATISTIC,
+        "loss_normalization": LOSS_NORMALIZATION,
+        "loss_scale_ema_decay": LOSS_SCALE_EMA_DECAY,
+        "loss_scale_eps": LOSS_SCALE_EPS,
         "dropout": config_value(config, "dropout"),
         "weight_decay": config_value(config, "weight_decay"),
     }
@@ -369,6 +398,20 @@ def run_dataset_experiment(
     print_feature_info(energy_model)
 
     print("\nBuilding dataloaders with answer masks and neighbours...")
+    feature_cache_path = None
+
+    if CACHE_FROZEN_LLM_FEATURES:
+        feature_cache_path = os.path.join(
+            FEATURE_CACHE_DIR,
+            (
+                "raw_layer_reprs_"
+                f"{slugify(model_name)}"
+                f"_max{MAX_LENGTH}"
+                f"_short{int(bool(USE_SHORT_ANSWER_IN_TEXT))}.pt"
+            ),
+        )
+        print(f"Frozen feature cache path: {feature_cache_path}")
+
     loaders = build_dataloaders(
         splits=splits,
         tokenizer=tokenizer,
@@ -381,6 +424,15 @@ def run_dataset_experiment(
         k_neighbours=config_value(config, "k_neighbours"),
         neighbour_backend=config_value(config, "neighbour_backend"),
         neighbour_embedding_model=NEIGHBOUR_EMBEDDING_MODEL,
+        neighbour_llm_base_model=base_model,
+        neighbour_llm_device=DEVICE,
+        neighbour_llm_batch_size=BATCH_SIZE,
+        cache_frozen_features=CACHE_FROZEN_LLM_FEATURES,
+        feature_cache_base_model=base_model,
+        feature_cache_energy_model=energy_model,
+        feature_cache_device=DEVICE,
+        feature_cache_path=feature_cache_path,
+        feature_cache_batch_size=FEATURE_CACHE_BATCH_SIZE,
     )
 
     sanity_check_train_loader(loaders)
@@ -418,6 +470,14 @@ def run_dataset_experiment(
         monitor_datasets=loaders["monitor_datasets"],
         early_stopping_patience=args.patience,
         early_stopping_min_delta=args.min_delta,
+        eval_every_epoch=EVAL_EVERY_EPOCH,
+        loss_normalization=LOSS_NORMALIZATION,
+        loss_scale_ema_decay=LOSS_SCALE_EMA_DECAY,
+        loss_scale_eps=LOSS_SCALE_EPS,
+        auto_loss_weighting=AUTO_LOSS_WEIGHTING,
+        auto_loss_reference=AUTO_LOSS_REFERENCE,
+        auto_loss_scale_batches=AUTO_LOSS_SCALE_BATCHES,
+        auto_loss_scale_statistic=AUTO_LOSS_SCALE_STATISTIC,
     )
 
     save_history(history, config, model_name, train_dataset)

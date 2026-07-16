@@ -1,15 +1,133 @@
 import csv
 import hashlib
+import os
 import random
 from typing import Dict, List, Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.neighbors import NearestNeighbors
 
 
 _NEIGHBOUR_INDEX_CACHE = {}
+
+
+def get_selected_layer_indices(total_layers: int):
+    if total_layers <= 0:
+        raise ValueError("total_layers must be positive.")
+
+    indices = [
+        0,
+        total_layers // 4,
+        total_layers // 2,
+        (3 * total_layers) // 4,
+        total_layers - 1,
+    ]
+
+    return [
+        max(0, min(int(idx), total_layers - 1))
+        for idx in indices
+    ]
+
+
+@torch.no_grad()
+def build_llm_hidden_question_embeddings(
+    questions,
+    tokenizer,
+    base_model,
+    device,
+    batch_size=16,
+    max_length=128,
+):
+    """
+    Build question-only KNN features from the frozen base LLM hidden states.
+
+    This intentionally uses only question text, never truthful/hallucinated
+    answers, so neighbour retrieval does not leak labels or answer content.
+    """
+
+    if tokenizer is None or base_model is None:
+        raise ValueError(
+            "llm_hidden neighbours require both tokenizer and base_model."
+        )
+
+    base_model.eval()
+    device = torch.device(device)
+
+    texts = [f"Question: {q}" for q in questions]
+    embeddings = []
+    selected_indices = None
+
+    total_batches = (len(texts) + batch_size - 1) // batch_size
+
+    for start in range(0, len(texts), batch_size):
+        end = min(start + batch_size, len(texts))
+        batch_texts = texts[start:end]
+        batch_id = start // batch_size + 1
+
+        if batch_id == 1 or batch_id == total_batches or batch_id % 25 == 0:
+            print(
+                "  LLM-hidden neighbour embedding batch "
+                f"{batch_id}/{total_batches}",
+                flush=True,
+            )
+
+        enc = tokenizer(
+            batch_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        enc = {
+            key: value.to(device)
+            for key, value in enc.items()
+        }
+
+        outputs = base_model(
+            **enc,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+
+        hidden_states = outputs.hidden_states[1:]
+        total_layers = len(hidden_states)
+
+        if selected_indices is None:
+            selected_indices = get_selected_layer_indices(total_layers)
+            print(
+                "  LLM-hidden selected layer indices: "
+                f"{selected_indices}",
+                flush=True,
+            )
+
+        attention_mask = enc["attention_mask"]
+        mask = attention_mask.unsqueeze(-1)
+
+        pooled_layers = []
+
+        for layer_idx in selected_indices:
+            hidden = hidden_states[layer_idx]
+            layer_mask = mask.to(
+                device=hidden.device,
+                dtype=hidden.dtype,
+            )
+            denom = layer_mask.sum(dim=1).clamp_min(1.0)
+            pooled = (hidden * layer_mask).sum(dim=1) / denom
+            pooled_layers.append(pooled.float())
+
+        batch_embeddings = torch.cat(pooled_layers, dim=-1)
+        batch_embeddings = F.normalize(
+            batch_embeddings,
+            p=2,
+            dim=-1,
+            eps=1e-8,
+        )
+        embeddings.append(batch_embeddings.cpu())
+
+    return torch.cat(embeddings, dim=0).numpy()
 
 
 # ---------------------------------------------------------------------
@@ -357,6 +475,198 @@ def tokenize_texts_with_answer_masks(
 
 
 # ---------------------------------------------------------------------
+# Frozen feature cache
+# ---------------------------------------------------------------------
+
+def feature_cache_key(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _feature_cache_metadata(
+    texts,
+    base_model,
+    energy_model,
+    max_length,
+    dtype,
+):
+    text_digest = hashlib.sha1(
+        "\n".join(sorted(feature_cache_key(text) for text in texts)).encode("utf-8")
+    ).hexdigest()
+
+    base_config = getattr(base_model, "config", None)
+
+    return {
+        "format": "raw_selected_answer_layer_reprs_v1",
+        "model_name": str(getattr(base_config, "_name_or_path", "")),
+        "max_length": int(max_length),
+        "hidden_size": int(getattr(energy_model, "hidden_size")),
+        "num_selected_layers": int(getattr(energy_model, "num_selected_layers")),
+        "selected_layer_indices": [
+            int(i)
+            for i in getattr(energy_model, "selected_layer_indices")
+        ],
+        "dtype": str(dtype).replace("torch.", ""),
+        "text_digest": text_digest,
+        "num_texts": int(len(set(texts))),
+    }
+
+
+def _metadata_matches(a, b):
+    return (
+        a.get("format") == b.get("format")
+        and a.get("model_name") == b.get("model_name")
+        and int(a.get("max_length", -1)) == int(b.get("max_length", -2))
+        and int(a.get("hidden_size", -1)) == int(b.get("hidden_size", -2))
+        and int(a.get("num_selected_layers", -1)) == int(b.get("num_selected_layers", -2))
+        and list(a.get("selected_layer_indices", [])) == list(b.get("selected_layer_indices", [None]))
+        and a.get("dtype") == b.get("dtype")
+        and a.get("text_digest") == b.get("text_digest")
+    )
+
+
+@torch.no_grad()
+def build_or_load_frozen_feature_cache(
+    texts,
+    tokenizer,
+    base_model,
+    energy_model,
+    device,
+    max_length=128,
+    batch_size=16,
+    cache_path=None,
+    dtype=torch.float16,
+):
+    """
+    Cache exactly the frozen representation used by the trainable EBM:
+
+        full question-claim sequence
+        -> frozen LLM hidden states
+        -> answer-token pooling
+        -> selected raw layer vectors
+
+    The projection head and energy head are not cached because they are
+    trainable.
+    """
+
+    unique_texts = list(dict.fromkeys(texts))
+
+    if not unique_texts:
+        return {}
+
+    metadata = _feature_cache_metadata(
+        texts=unique_texts,
+        base_model=base_model,
+        energy_model=energy_model,
+        max_length=max_length,
+        dtype=dtype,
+    )
+
+    if cache_path:
+        cache_path = os.path.abspath(cache_path)
+        if os.path.exists(cache_path):
+            cached = torch.load(cache_path, map_location="cpu")
+            cached_metadata = cached.get("metadata", {})
+            if _metadata_matches(cached_metadata, metadata):
+                print(
+                    "Using cached frozen LLM answer-layer features: "
+                    f"{cache_path}",
+                    flush=True,
+                )
+                keys = cached["keys"]
+                features = cached["features"]
+                return {
+                    key: features[i]
+                    for i, key in enumerate(keys)
+                }
+
+            print(
+                "Ignoring stale frozen feature cache because metadata changed: "
+                f"{cache_path}",
+                flush=True,
+            )
+
+    print(
+        "Precomputing frozen LLM answer-layer features "
+        f"for {len(unique_texts)} unique question-answer texts...",
+        flush=True,
+    )
+
+    base_model.eval()
+    energy_model.eval()
+    device = torch.device(device)
+
+    keys = []
+    feature_batches = []
+    total_batches = (len(unique_texts) + batch_size - 1) // batch_size
+
+    for start in range(0, len(unique_texts), batch_size):
+        end = min(start + batch_size, len(unique_texts))
+        batch_texts = unique_texts[start:end]
+        batch_id = start // batch_size + 1
+
+        if batch_id == 1 or batch_id == total_batches or batch_id % 25 == 0:
+            print(
+                f"  frozen feature batch {batch_id}/{total_batches}",
+                flush=True,
+            )
+
+        encoded = tokenize_texts_with_answer_masks(
+            tokenizer=tokenizer,
+            texts=batch_texts,
+            max_length=max_length,
+        )
+
+        input_ids = encoded["input_ids"].to(device, non_blocking=True)
+        attention_mask = encoded["attention_mask"].to(device, non_blocking=True)
+        answer_mask = encoded["answer_mask"].to(device, non_blocking=True)
+
+        outputs = base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+
+        raw_layer_reprs = energy_model.get_raw_layer_reprs(
+            hidden_states=outputs.hidden_states,
+            attention_mask=attention_mask,
+            answer_mask=answer_mask,
+        )
+
+        raw_layer_reprs = torch.nan_to_num(
+            raw_layer_reprs.detach().cpu().to(dtype=dtype),
+            nan=0.0,
+            posinf=1e6,
+            neginf=-1e6,
+        )
+
+        feature_batches.append(raw_layer_reprs)
+        keys.extend(feature_cache_key(text) for text in batch_texts)
+
+    features = torch.cat(feature_batches, dim=0).contiguous()
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = f"{cache_path}.tmp"
+        torch.save(
+            {
+                "metadata": metadata,
+                "keys": keys,
+                "features": features,
+            },
+            tmp_path,
+        )
+        os.replace(tmp_path, cache_path)
+        print(f"Saved frozen feature cache to: {cache_path}", flush=True)
+
+    return {
+        key: features[i]
+        for i, key in enumerate(keys)
+    }
+
+
+# ---------------------------------------------------------------------
 # Datasets
 # ---------------------------------------------------------------------
 
@@ -369,9 +679,11 @@ class ClaimDataset(Dataset):
         self,
         examples,
         use_short_answer=False,
+        feature_cache=None,
     ):
         self.examples = examples
         self.use_short_answer = use_short_answer
+        self.feature_cache = feature_cache
 
     def __len__(self):
         return len(self.examples)
@@ -393,7 +705,7 @@ class ClaimDataset(Dataset):
             ex.get("short_answer", ""),
         )
 
-        return {
+        item = {
             "text": text,
             "dataset": ex["dataset"],
             "question": ex["question"],
@@ -402,6 +714,11 @@ class ClaimDataset(Dataset):
             "label": float(ex["label"]),
             "label_name": ex["label_name"],
         }
+
+        if self.feature_cache is not None:
+            item["raw_layer_reprs"] = self.feature_cache[feature_cache_key(text)]
+
+        return item
 
 
 class PairClaimDataset(Dataset):
@@ -422,12 +739,24 @@ class PairClaimDataset(Dataset):
         k_neighbours=5,
         neighbour_backend="sentence",
         neighbour_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+        llm_tokenizer=None,
+        llm_base_model=None,
+        llm_device=None,
+        llm_hidden_batch_size=16,
+        llm_hidden_max_length=128,
+        feature_cache=None,
     ):
         self.rows = rows
         self.use_short_answer = use_short_answer
         self.k_neighbours = k_neighbours
         self.neighbour_backend = neighbour_backend
         self.neighbour_embedding_model = neighbour_embedding_model
+        self.llm_tokenizer = llm_tokenizer
+        self.llm_base_model = llm_base_model
+        self.llm_device = llm_device
+        self.llm_hidden_batch_size = llm_hidden_batch_size
+        self.llm_hidden_max_length = llm_hidden_max_length
+        self.feature_cache = feature_cache
 
         self.neighbour_indices = self._build_neighbour_indices(
             k=k_neighbours,
@@ -459,6 +788,7 @@ class PairClaimDataset(Dataset):
             none     -> no neighbours
             tfidf    -> sparse lexical nearest neighbours
             sentence -> dense sentence-embedding nearest neighbours
+            llm_hidden -> frozen base-LLM hidden-state question neighbours
 
         The returned indices point into self.rows.
         """
@@ -475,6 +805,9 @@ class PairClaimDataset(Dataset):
             backend,
             int(k),
             str(embedding_model_name),
+            str(getattr(getattr(self.llm_base_model, "config", None), "_name_or_path", "")),
+            int(self.llm_hidden_max_length),
+            int(self.llm_hidden_batch_size),
             question_digest,
         )
 
@@ -548,10 +881,51 @@ class PairClaimDataset(Dataset):
                     "check the embedding model name."
                 ) from e
 
+        elif backend in {"llm_hidden", "llm", "hidden"}:
+            try:
+                model_name = str(
+                    getattr(
+                        getattr(self.llm_base_model, "config", None),
+                        "_name_or_path",
+                        "frozen_base_lm",
+                    )
+                )
+
+                print(
+                    "Building frozen-LLM hidden-state question neighbours "
+                    f"with {model_name} "
+                    f"(k={k}, rows={len(self.rows)})..."
+                )
+
+                embeddings = build_llm_hidden_question_embeddings(
+                    questions=questions,
+                    tokenizer=self.llm_tokenizer,
+                    base_model=self.llm_base_model,
+                    device=self.llm_device,
+                    batch_size=self.llm_hidden_batch_size,
+                    max_length=self.llm_hidden_max_length,
+                )
+
+                n_neighbours = min(k + 1, len(self.rows))
+                index = NearestNeighbors(
+                    n_neighbors=n_neighbours,
+                    metric="cosine",
+                    algorithm="brute",
+                )
+                index.fit(embeddings)
+                _, nearest_indices = index.kneighbors(embeddings)
+
+            except Exception as e:
+                raise RuntimeError(
+                    "Could not build LLM-hidden neighbours. "
+                    "Check that tokenizer/base_model/device were passed to "
+                    "build_dataloaders."
+                ) from e
+
         else:
             raise ValueError(
                 "Unknown neighbour backend: "
-                f"{backend}. Use one of: none, tfidf, sentence."
+                f"{backend}. Use one of: none, tfidf, sentence, llm_hidden."
             )
 
         neighbours = []
@@ -607,7 +981,7 @@ class PairClaimDataset(Dataset):
                 )
             )
 
-        return {
+        item = {
             "dataset": row["dataset"],
             "question": question,
             "short_answer": short_answer,
@@ -621,6 +995,42 @@ class PairClaimDataset(Dataset):
             "neigh_pos_texts": neigh_pos_texts,
             "neigh_neg_texts": neigh_neg_texts,
         }
+
+        if self.feature_cache is not None:
+            item["pos_raw_layer_reprs"] = self.feature_cache[feature_cache_key(pos_text)]
+            item["neg_raw_layer_reprs"] = self.feature_cache[feature_cache_key(neg_text)]
+            item["neigh_pos_raw_layer_reprs"] = [
+                self.feature_cache[feature_cache_key(text)]
+                for text in neigh_pos_texts
+            ]
+            item["neigh_neg_raw_layer_reprs"] = [
+                self.feature_cache[feature_cache_key(text)]
+                for text in neigh_neg_texts
+            ]
+
+        return item
+
+
+def build_question_neighbour_indices(
+    rows,
+    k=5,
+    backend="sentence",
+    embedding_model_name="sentence-transformers/all-MiniLM-L6-v2",
+):
+    """
+    Build question-neighbour indices using the same implementation as training.
+
+    This helper is intended for inspection notebooks and analysis scripts. It
+    returns row indices into `rows`.
+    """
+    dataset = PairClaimDataset(
+        rows=rows,
+        use_short_answer=False,
+        k_neighbours=k,
+        neighbour_backend=backend,
+        neighbour_embedding_model=embedding_model_name,
+    )
+    return dataset.neighbour_indices
 
 
 # ---------------------------------------------------------------------
@@ -668,6 +1078,16 @@ def make_pair_collate_fn(tokenizer, max_length):
             "raw_batch": batch,
         }
 
+        if "pos_raw_layer_reprs" in batch[0]:
+            out["pos_raw_layer_reprs"] = torch.stack(
+                [x["pos_raw_layer_reprs"] for x in batch],
+                dim=0,
+            )
+            out["neg_raw_layer_reprs"] = torch.stack(
+                [x["neg_raw_layer_reprs"] for x in batch],
+                dim=0,
+            )
+
         if sum(k_list) > 0:
             neigh_pos_enc = tokenize_texts_with_answer_masks(
                 tokenizer,
@@ -693,6 +1113,24 @@ def make_pair_collate_fn(tokenizer, max_length):
                 }
             )
 
+            if "pos_raw_layer_reprs" in batch[0]:
+                out["neigh_pos_raw_layer_reprs"] = torch.stack(
+                    [
+                        raw
+                        for x in batch
+                        for raw in x["neigh_pos_raw_layer_reprs"]
+                    ],
+                    dim=0,
+                )
+                out["neigh_neg_raw_layer_reprs"] = torch.stack(
+                    [
+                        raw
+                        for x in batch
+                        for raw in x["neigh_neg_raw_layer_reprs"]
+                    ],
+                    dim=0,
+                )
+
         return out
 
     return collate_fn
@@ -709,13 +1147,21 @@ def make_claim_collate_fn(tokenizer, max_length):
             max_length,
         )
 
-        return {
+        out = {
             "input_ids": enc["input_ids"],
             "attention_mask": enc["attention_mask"],
             "answer_mask": enc["answer_mask"],
             "labels": labels,
             "raw_batch": batch,
         }
+
+        if "raw_layer_reprs" in batch[0]:
+            out["raw_layer_reprs"] = torch.stack(
+                [x["raw_layer_reprs"] for x in batch],
+                dim=0,
+            )
+
+        return out
 
     return collate_fn
 
@@ -736,6 +1182,15 @@ def build_dataloaders(
     k_neighbours=5,
     neighbour_backend="sentence",
     neighbour_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+    neighbour_llm_base_model=None,
+    neighbour_llm_device=None,
+    neighbour_llm_batch_size=16,
+    cache_frozen_features=False,
+    feature_cache_base_model=None,
+    feature_cache_energy_model=None,
+    feature_cache_device=None,
+    feature_cache_path=None,
+    feature_cache_batch_size=16,
 ):
     train_dataset = normalize_dataset_key(train_dataset)
 
@@ -751,9 +1206,6 @@ def build_dataloaders(
             for name in eval_datasets
         ]
 
-    pair_collate_fn = make_pair_collate_fn(tokenizer, max_length)
-    claim_collate_fn = make_claim_collate_fn(tokenizer, max_length)
-
     if train_dataset not in splits["datasets"]:
         raise KeyError(f"Unknown train dataset: {train_dataset}")
 
@@ -763,15 +1215,6 @@ def build_dataloaders(
     if len(train_rows) == 0:
         raise ValueError(f"No rows available for train dataset: {train_dataset}")
 
-    train_ds = PairClaimDataset(
-        train_rows,
-        use_short_answer=use_short_answer,
-        k_neighbours=k_neighbours,
-        neighbour_backend=neighbour_backend,
-        neighbour_embedding_model=neighbour_embedding_model,
-    )
-
-    eval_loaders = {}
     train_eval_name = f"{train_dataset}_train"
     validation_eval_name = f"{train_dataset}_val"
 
@@ -787,22 +1230,10 @@ def build_dataloaders(
     if len(validation_examples) == 0:
         validation_examples = train_examples
 
-    for eval_name, eval_examples in [
+    eval_example_specs = [
         (train_eval_name, train_examples),
         (validation_eval_name, validation_examples),
-    ]:
-        eval_ds = ClaimDataset(
-            eval_examples,
-            use_short_answer=use_short_answer,
-        )
-
-        eval_loaders[eval_name] = DataLoader(
-            eval_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=claim_collate_fn,
-            num_workers=num_workers,
-        )
+    ]
 
     for dataset_name in eval_datasets:
         if dataset_name not in splits["datasets"]:
@@ -813,12 +1244,88 @@ def build_dataloaders(
         if len(eval_examples) == 0:
             raise ValueError(f"No examples available for eval dataset: {dataset_name}")
 
+        eval_example_specs.append((dataset_name, eval_examples))
+
+    feature_cache = None
+
+    if cache_frozen_features:
+        if feature_cache_base_model is None or feature_cache_energy_model is None:
+            raise ValueError(
+                "cache_frozen_features=True requires feature_cache_base_model "
+                "and feature_cache_energy_model."
+            )
+
+        cache_texts = []
+
+        for row in train_rows:
+            short_answer = row.get("short_answer", "")
+            cache_texts.append(
+                format_question_claim(
+                    row["question"],
+                    row["positive"],
+                    short_answer=short_answer,
+                    use_short_answer=use_short_answer,
+                )
+            )
+            cache_texts.append(
+                format_question_claim(
+                    row["question"],
+                    row["negative"],
+                    short_answer=short_answer,
+                    use_short_answer=use_short_answer,
+                )
+            )
+
+        for _, examples in eval_example_specs:
+            for ex in examples:
+                cache_texts.append(
+                    format_question_claim(
+                        ex["question"],
+                        ex["claim"],
+                        short_answer=ex.get("short_answer", ""),
+                        use_short_answer=use_short_answer,
+                    )
+                )
+
+        feature_cache = build_or_load_frozen_feature_cache(
+            texts=cache_texts,
+            tokenizer=tokenizer,
+            base_model=feature_cache_base_model,
+            energy_model=feature_cache_energy_model,
+            device=feature_cache_device or neighbour_llm_device or "cpu",
+            max_length=max_length,
+            batch_size=feature_cache_batch_size,
+            cache_path=feature_cache_path,
+            dtype=torch.float16,
+        )
+
+    pair_collate_fn = make_pair_collate_fn(tokenizer, max_length)
+    claim_collate_fn = make_claim_collate_fn(tokenizer, max_length)
+
+    train_ds = PairClaimDataset(
+        train_rows,
+        use_short_answer=use_short_answer,
+        k_neighbours=k_neighbours,
+        neighbour_backend=neighbour_backend,
+        neighbour_embedding_model=neighbour_embedding_model,
+        llm_tokenizer=tokenizer,
+        llm_base_model=neighbour_llm_base_model,
+        llm_device=neighbour_llm_device,
+        llm_hidden_batch_size=neighbour_llm_batch_size,
+        llm_hidden_max_length=max_length,
+        feature_cache=feature_cache,
+    )
+
+    eval_loaders = {}
+
+    for eval_name, eval_examples in eval_example_specs:
         eval_ds = ClaimDataset(
             eval_examples,
             use_short_answer=use_short_answer,
+            feature_cache=feature_cache,
         )
 
-        eval_loaders[dataset_name] = DataLoader(
+        eval_loaders[eval_name] = DataLoader(
             eval_ds,
             batch_size=batch_size,
             shuffle=False,

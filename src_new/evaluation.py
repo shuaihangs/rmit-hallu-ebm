@@ -106,19 +106,21 @@ def evaluate_loader(
             pos_out = forward_energy(
                 base_model,
                 energy_model,
-                batch["pos_input_ids"],
-                batch["pos_attention_mask"],
+                batch.get("pos_input_ids", None),
+                batch.get("pos_attention_mask", None),
                 device,
                 answer_mask=batch.get("pos_answer_mask", None),
+                raw_layer_reprs=batch.get("pos_raw_layer_reprs", None),
             )
 
             neg_out = forward_energy(
                 base_model,
                 energy_model,
-                batch["neg_input_ids"],
-                batch["neg_attention_mask"],
+                batch.get("neg_input_ids", None),
+                batch.get("neg_attention_mask", None),
                 device,
                 answer_mask=batch.get("neg_answer_mask", None),
+                raw_layer_reprs=batch.get("neg_raw_layer_reprs", None),
             )
 
             pos_logits = pos_out["energy_logit"]
@@ -160,10 +162,11 @@ def evaluate_loader(
             out = forward_energy(
                 base_model,
                 energy_model,
-                batch["input_ids"],
-                batch["attention_mask"],
+                batch.get("input_ids", None),
+                batch.get("attention_mask", None),
                 device,
                 answer_mask=batch.get("answer_mask", None),
+                raw_layer_reprs=batch.get("raw_layer_reprs", None),
             )
 
             logits = out["energy_logit"]

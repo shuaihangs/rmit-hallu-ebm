@@ -434,11 +434,25 @@ def get_hidden_states(base_model, input_ids, attention_mask, device):
 def forward_energy(
     base_model,
     energy_model,
-    input_ids,
-    attention_mask,
-    device,
+    input_ids=None,
+    attention_mask=None,
+    device=None,
     answer_mask=None,
+    raw_layer_reprs=None,
 ):
+    if device is None:
+        device = next(energy_model.parameters()).device
+
+    if raw_layer_reprs is not None:
+        raw_layer_reprs = raw_layer_reprs.to(device, non_blocking=True)
+        return energy_model.energy_from_raw_layer_reprs(raw_layer_reprs)
+
+    if input_ids is None or attention_mask is None:
+        raise ValueError(
+            "forward_energy requires either raw_layer_reprs or "
+            "input_ids + attention_mask."
+        )
+
     attention_mask, hidden_states = get_hidden_states(
         base_model,
         input_ids,
