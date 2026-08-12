@@ -36,9 +36,6 @@ from src_new.config import (
     AUTO_LOSS_REFERENCE,
     AUTO_LOSS_SCALE_BATCHES,
     AUTO_LOSS_SCALE_STATISTIC,
-    LOSS_NORMALIZATION,
-    LOSS_SCALE_EMA_DECAY,
-    LOSS_SCALE_EPS,
 
     NEIGHBOUR_EMBEDDING_MODEL,
     TUNING_CONFIGS,
@@ -102,6 +99,17 @@ def ensure_output_dirs():
     os.makedirs(HISTORY_DIR, exist_ok=True)
 
 
+def configure_output_dir(output_dir):
+    if output_dir is None:
+        return
+
+    global OUTPUT_DIR, CHECKPOINT_DIR, HISTORY_DIR, FEATURE_CACHE_DIR
+    OUTPUT_DIR = os.path.normpath(output_dir)
+    CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+    HISTORY_DIR = os.path.join(OUTPUT_DIR, "histories")
+    FEATURE_CACHE_DIR = os.path.join(OUTPUT_DIR, "feature_cache")
+
+
 def configure_determinism():
     set_seed(SEED)
     torch.use_deterministic_algorithms(True, warn_only=True)
@@ -150,6 +158,19 @@ def parse_args():
         type=float,
         default=EARLY_STOPPING_MIN_DELTA,
         help="Minimum source validation AUC gain that resets patience.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Optional isolated output directory. Checkpoints, histories, and "
+            "the frozen-feature cache are stored beneath it."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume complete experiments from an existing summary.",
     )
     return parser.parse_args()
 
@@ -208,9 +229,6 @@ def print_run_settings(models, train_datasets, configs, args):
     print(f"AUTO_LOSS_REFERENCE: {AUTO_LOSS_REFERENCE}")
     print(f"AUTO_LOSS_SCALE_BATCHES: {AUTO_LOSS_SCALE_BATCHES}")
     print(f"AUTO_LOSS_SCALE_STATISTIC: {AUTO_LOSS_SCALE_STATISTIC}")
-    print(f"LOSS_NORMALIZATION: {LOSS_NORMALIZATION}")
-    print(f"LOSS_SCALE_EMA_DECAY: {LOSS_SCALE_EMA_DECAY}")
-    print(f"LOSS_SCALE_EPS: {LOSS_SCALE_EPS}")
     print(f"BATCH_SIZE: {BATCH_SIZE}")
     print(f"MAX_LENGTH: {MAX_LENGTH}")
     print(f"VALIDATION_RATIO: {VALIDATION_RATIO}")
@@ -330,9 +348,6 @@ def add_config_columns(rows, config):
         "auto_loss_reference": AUTO_LOSS_REFERENCE,
         "auto_loss_scale_batches": AUTO_LOSS_SCALE_BATCHES,
         "auto_loss_scale_statistic": AUTO_LOSS_SCALE_STATISTIC,
-        "loss_normalization": LOSS_NORMALIZATION,
-        "loss_scale_ema_decay": LOSS_SCALE_EMA_DECAY,
-        "loss_scale_eps": LOSS_SCALE_EPS,
         "dropout": config_value(config, "dropout"),
         "weight_decay": config_value(config, "weight_decay"),
     }
@@ -471,9 +486,6 @@ def run_dataset_experiment(
         early_stopping_patience=args.patience,
         early_stopping_min_delta=args.min_delta,
         eval_every_epoch=EVAL_EVERY_EPOCH,
-        loss_normalization=LOSS_NORMALIZATION,
-        loss_scale_ema_decay=LOSS_SCALE_EMA_DECAY,
-        loss_scale_eps=LOSS_SCALE_EPS,
         auto_loss_weighting=AUTO_LOSS_WEIGHTING,
         auto_loss_reference=AUTO_LOSS_REFERENCE,
         auto_loss_scale_batches=AUTO_LOSS_SCALE_BATCHES,
@@ -564,15 +576,84 @@ def save_summary(result_rows):
         import pandas as pd
 
         summary_path = os.path.join(OUTPUT_DIR, "experiment_summary.csv")
-        pd.DataFrame(result_rows).to_csv(summary_path, index=False)
+        temporary_path = f"{summary_path}.tmp"
+        pd.DataFrame(result_rows).to_csv(temporary_path, index=False)
+        os.replace(temporary_path, summary_path)
         print(f"\nSaved experiment summary to: {summary_path}")
 
     except Exception as e:
         print(f"\nCould not save experiment summary CSV: {e}")
 
 
+def experiment_key(model_name, config_name, train_dataset):
+    return str(model_name), str(config_name), str(train_dataset)
+
+
+def expected_eval_datasets(train_dataset):
+    return {
+        f"{train_dataset}_train",
+        f"{train_dataset}_val",
+        *(
+            dataset_name
+            for dataset_name in DATASET_NAMES
+            if dataset_name != train_dataset
+        ),
+    }
+
+
+def load_resume_rows():
+    summary_path = os.path.join(OUTPUT_DIR, "experiment_summary.csv")
+    if not os.path.exists(summary_path):
+        print(f"\nNo existing summary to resume: {summary_path}")
+        return [], set()
+
+    import pandas as pd
+
+    existing = pd.read_csv(summary_path)
+    required_columns = {
+        "model_name",
+        "config_name",
+        "train_dataset",
+        "eval_dataset",
+    }
+    missing_columns = required_columns.difference(existing.columns)
+    if missing_columns:
+        raise ValueError(
+            "Cannot resume summary with missing columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    complete_keys = set()
+    for key, group in existing.groupby(
+        ["model_name", "config_name", "train_dataset"],
+        dropna=False,
+    ):
+        train_dataset = str(key[2])
+        actual_eval_datasets = set(group["eval_dataset"].astype(str))
+        if actual_eval_datasets == expected_eval_datasets(train_dataset):
+            complete_keys.add(tuple(str(value) for value in key))
+
+    retained = existing[
+        existing.apply(
+            lambda row: experiment_key(
+                row["model_name"],
+                row["config_name"],
+                row["train_dataset"],
+            )
+            in complete_keys,
+            axis=1,
+        )
+    ]
+    print(
+        f"\nResume summary: retained {len(retained)} rows from "
+        f"{len(complete_keys)} complete experiments."
+    )
+    return retained.to_dict("records"), complete_keys
+
+
 def main():
     args = parse_args()
+    configure_output_dir(args.output_dir)
     selected_models = select_models(args.models)
     selected_train_datasets = select_datasets(args.train_datasets)
     selected_configs = select_configs(args.configs)
@@ -609,7 +690,10 @@ def main():
     print_split_counts(splits)
     validate_required_splits(splits, DATASET_NAMES)
 
-    all_result_rows = []
+    if args.resume:
+        all_result_rows, completed_keys = load_resume_rows()
+    else:
+        all_result_rows, completed_keys = [], set()
 
     for model_name in selected_models:
         print("\n==============================================")
@@ -622,6 +706,45 @@ def main():
         try:
             for config in selected_configs:
                 for train_dataset in selected_train_datasets:
+                    key = experiment_key(
+                        model_name,
+                        config_value(config, "name"),
+                        train_dataset,
+                    )
+                    has_artifacts = (
+                        os.path.exists(
+                            checkpoint_path(config, model_name, train_dataset)
+                        )
+                        and os.path.exists(
+                            history_path(config, model_name, train_dataset)
+                        )
+                    )
+                    if key in completed_keys and has_artifacts:
+                        print(
+                            "\nSkipping complete experiment: "
+                            f"model={model_name}, config={config['name']}, "
+                            f"train_dataset={train_dataset}"
+                        )
+                        continue
+
+                    if key in completed_keys:
+                        print(
+                            "\nRerunning experiment with missing artifacts: "
+                            f"model={model_name}, config={config['name']}, "
+                            f"train_dataset={train_dataset}"
+                        )
+                        all_result_rows = [
+                            row
+                            for row in all_result_rows
+                            if experiment_key(
+                                row["model_name"],
+                                row["config_name"],
+                                row["train_dataset"],
+                            )
+                            != key
+                        ]
+                        completed_keys.remove(key)
+
                     result_rows = run_dataset_experiment(
                         config=config,
                         model_name=model_name,
@@ -632,6 +755,7 @@ def main():
                         args=args,
                     )
                     all_result_rows.extend(result_rows)
+                    completed_keys.add(key)
                     save_summary(all_result_rows)
 
         finally:

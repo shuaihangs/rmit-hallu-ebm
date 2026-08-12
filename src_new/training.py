@@ -93,86 +93,6 @@ LOSS_TERM_KEYS = (
 )
 
 
-def update_loss_scales(raw_losses, loss_scales, decay=0.98, eps=1e-8):
-    """
-    Maintain an EMA scale for each raw loss term.
-
-    The scales are detached Python floats. They normalize objective magnitudes
-    but do not create gradients through the normalization statistics.
-    """
-
-    for key in LOSS_TERM_KEYS:
-        value = float(raw_losses[key].detach().cpu().item())
-        value = max(value, eps)
-
-        if key not in loss_scales:
-            loss_scales[key] = value
-        else:
-            loss_scales[key] = decay * loss_scales[key] + (1.0 - decay) * value
-
-
-def normalize_loss_terms(
-    raw_losses,
-    loss_normalization="none",
-    loss_scales=None,
-    loss_scale_ema_decay=0.98,
-    loss_scale_eps=1e-8,
-):
-    """
-    Return objective losses after optional dynamic range normalization.
-
-    Supported modes:
-        none: use raw losses directly.
-        ema:  divide each term by an EMA of its recent raw magnitude.
-    """
-
-    mode = str(loss_normalization).lower()
-
-    if mode in {"none", "off", "false"}:
-        objective_losses = dict(raw_losses)
-        normalized_losses = dict(raw_losses)
-        scales = {key: 1.0 for key in LOSS_TERM_KEYS}
-        effective_weights = {key: 1.0 for key in LOSS_TERM_KEYS}
-        return objective_losses, normalized_losses, scales, effective_weights
-
-    if mode != "ema":
-        raise ValueError(
-            "Unknown loss_normalization mode: "
-            f"{loss_normalization!r}. Expected 'none' or 'ema'."
-        )
-
-    if loss_scales is None:
-        raise ValueError("loss_scales must be provided when loss_normalization='ema'.")
-
-    update_loss_scales(
-        raw_losses=raw_losses,
-        loss_scales=loss_scales,
-        decay=loss_scale_ema_decay,
-        eps=loss_scale_eps,
-    )
-
-    objective_losses = {}
-    normalized_losses = {}
-    scales = {}
-
-    for key in LOSS_TERM_KEYS:
-        loss = raw_losses[key]
-        scale_value = max(float(loss_scales[key]), loss_scale_eps)
-        scale = loss.detach().new_tensor(scale_value)
-        normalized_loss = loss / scale
-
-        objective_losses[key] = normalized_loss
-        normalized_losses[key] = normalized_loss
-        scales[key] = scale_value
-
-    effective_weights = {
-        key: 1.0 / max(scales[key], loss_scale_eps)
-        for key in LOSS_TERM_KEYS
-    }
-
-    return objective_losses, normalized_losses, scales, effective_weights
-
-
 def _forward_pair_batch(
     batch,
     base_model,
@@ -307,7 +227,6 @@ def estimate_loss_scales(
                 lambda_neighbour_rank=1.0,
                 rank_margin=rank_margin,
                 neighbour_margin=neighbour_margin,
-                loss_normalization="none",
             )
 
             for key in LOSS_TERM_KEYS:
@@ -391,10 +310,6 @@ def compute_energy_losses(
     lambda_neighbour_rank=0.1,
     rank_margin=1.0,
     neighbour_margin=1.0,
-    loss_normalization="none",
-    loss_scales=None,
-    loss_scale_ema_decay=0.98,
-    loss_scale_eps=1e-8,
 ):
     """
     Projection EBM objective with hard cross-neighbour ranking.
@@ -528,22 +443,14 @@ def compute_energy_losses(
         "neighbour_rank_loss": neighbour_rank_loss,
     }
 
-    objective_losses, normalized_losses, scales, effective_weights = normalize_loss_terms(
-        raw_losses=raw_losses,
-        loss_normalization=loss_normalization,
-        loss_scales=loss_scales,
-        loss_scale_ema_decay=loss_scale_ema_decay,
-        loss_scale_eps=loss_scale_eps,
-    )
-
     # ---------------------------------------------------------
     # 5. Total objective
     # ---------------------------------------------------------
     total_loss = (
-        lambda_bce * objective_losses["bce_loss"]
-        + lambda_pair_rank * objective_losses["pair_rank_loss"]
-        + lambda_inbatch_rank * objective_losses["inbatch_rank_loss"]
-        + lambda_neighbour_rank * objective_losses["neighbour_rank_loss"]
+        lambda_bce * raw_losses["bce_loss"]
+        + lambda_pair_rank * raw_losses["pair_rank_loss"]
+        + lambda_inbatch_rank * raw_losses["inbatch_rank_loss"]
+        + lambda_neighbour_rank * raw_losses["neighbour_rank_loss"]
     )
 
     return {
@@ -552,18 +459,6 @@ def compute_energy_losses(
         "pair_rank_loss": raw_losses["pair_rank_loss"],
         "inbatch_rank_loss": raw_losses["inbatch_rank_loss"],
         "neighbour_rank_loss": raw_losses["neighbour_rank_loss"],
-        "bce_loss_normalized": normalized_losses["bce_loss"],
-        "pair_rank_loss_normalized": normalized_losses["pair_rank_loss"],
-        "inbatch_rank_loss_normalized": normalized_losses["inbatch_rank_loss"],
-        "neighbour_rank_loss_normalized": normalized_losses["neighbour_rank_loss"],
-        "bce_loss_scale": scales["bce_loss"],
-        "pair_rank_loss_scale": scales["pair_rank_loss"],
-        "inbatch_rank_loss_scale": scales["inbatch_rank_loss"],
-        "neighbour_rank_loss_scale": scales["neighbour_rank_loss"],
-        "bce_loss_effective_weight": effective_weights["bce_loss"],
-        "pair_rank_loss_effective_weight": effective_weights["pair_rank_loss"],
-        "inbatch_rank_loss_effective_weight": effective_weights["inbatch_rank_loss"],
-        "neighbour_rank_loss_effective_weight": effective_weights["neighbour_rank_loss"],
     }
 
 
@@ -584,10 +479,6 @@ def train_one_epoch(
     lambda_neighbour_rank=0.1,
     rank_margin=1.0,
     neighbour_margin=1.0,
-    loss_normalization="none",
-    loss_scales=None,
-    loss_scale_ema_decay=0.98,
-    loss_scale_eps=1e-8,
 ):
     """
     One epoch of projection-EBM training.
@@ -601,9 +492,6 @@ def train_one_epoch(
 
     base_model.eval()
     energy_model.train()
-
-    if loss_scales is None:
-        loss_scales = {}
 
     running = {}
 
@@ -704,10 +592,6 @@ def train_one_epoch(
             lambda_neighbour_rank=lambda_neighbour_rank,
             rank_margin=rank_margin,
             neighbour_margin=neighbour_margin,
-            loss_normalization=loss_normalization,
-            loss_scales=loss_scales,
-            loss_scale_ema_decay=loss_scale_ema_decay,
-            loss_scale_eps=loss_scale_eps,
         )
 
         loss = loss_dict["total_loss"]
@@ -767,9 +651,6 @@ def train_model(
     early_stopping_patience=None,
     early_stopping_min_delta=0.0,
     eval_every_epoch=True,
-    loss_normalization="none",
-    loss_scale_ema_decay=0.98,
-    loss_scale_eps=1e-8,
     auto_loss_weighting=False,
     auto_loss_reference="bce_loss",
     auto_loss_scale_batches=100,
@@ -790,7 +671,6 @@ def train_model(
     epochs_without_improvement = 0
     history = []
     eval_loaders = loaders.get("eval", {})
-    loss_scales = {}
     auto_loss_scales = {}
     auto_loss_weights = {}
 
@@ -800,7 +680,7 @@ def train_model(
     if monitor_datasets is None:
         monitor_datasets = list(eval_datasets)
 
-    configured_loss_gates = {
+    configured_loss_coefficients = {
         "lambda_bce": lambda_bce,
         "lambda_pair_rank": lambda_pair_rank,
         "lambda_inbatch_rank": lambda_inbatch_rank,
@@ -826,7 +706,6 @@ def train_model(
             max_batches=auto_loss_scale_batches,
             statistic=auto_loss_scale_statistic,
             reference_key=auto_loss_reference,
-            eps=loss_scale_eps,
         )
 
         lambda_bce = auto_loss_weights["bce_loss"]
@@ -864,10 +743,6 @@ def train_model(
             lambda_neighbour_rank=lambda_neighbour_rank,
             rank_margin=rank_margin,
             neighbour_margin=neighbour_margin,
-            loss_normalization=loss_normalization,
-            loss_scales=loss_scales,
-            loss_scale_ema_decay=loss_scale_ema_decay,
-            loss_scale_eps=loss_scale_eps,
         )
 
         eval_metrics = {}
@@ -948,17 +823,15 @@ def train_model(
                         "lambda_neighbour_rank": lambda_neighbour_rank,
                         "rank_margin": rank_margin,
                         "neighbour_margin": neighbour_margin,
-                        "loss_normalization": loss_normalization,
-                        "loss_scale_ema_decay": loss_scale_ema_decay,
-                        "loss_scale_eps": loss_scale_eps,
-                        "loss_scales": dict(loss_scales),
                         "auto_loss_weighting": auto_loss_weighting,
                         "auto_loss_reference": auto_loss_reference,
                         "auto_loss_scale_batches": auto_loss_scale_batches,
                         "auto_loss_scale_statistic": auto_loss_scale_statistic,
                         "auto_loss_scales": dict(auto_loss_scales),
                         "auto_loss_weights": dict(auto_loss_weights),
-                        "configured_loss_gates": dict(configured_loss_gates),
+                        "configured_loss_coefficients": dict(
+                            configured_loss_coefficients
+                        ),
 
                         "model_name": model_name,
                         "train_dataset": train_dataset,
@@ -997,9 +870,6 @@ def train_model(
             "best_monitor_auc": best_monitor_auc,
             "epochs_without_improvement": epochs_without_improvement,
             "saved_best": saved_best,
-            "loss_normalization": loss_normalization,
-            "loss_scale_ema_decay": loss_scale_ema_decay,
-            "loss_scale_eps": loss_scale_eps,
             "auto_loss_weighting": auto_loss_weighting,
             "auto_loss_reference": auto_loss_reference,
             "auto_loss_scale_batches": auto_loss_scale_batches,
@@ -1025,10 +895,10 @@ def train_model(
         log_parts = [
             f"Epoch {epoch:03d}",
             f"Objective={row['total_loss']:.4f}",
-            f"BCE={row['bce_loss']:.4f}/norm={row.get('bce_loss_normalized', row['bce_loss']):.4f}",
-            f"PairRank={row['pair_rank_loss']:.4f}/norm={row.get('pair_rank_loss_normalized', row['pair_rank_loss']):.4f}",
-            f"InBatchRank={row['inbatch_rank_loss']:.4f}/norm={row.get('inbatch_rank_loss_normalized', row['inbatch_rank_loss']):.4f}",
-            f"HardCrossNeighRank={row['neighbour_rank_loss']:.4f}/norm={row.get('neighbour_rank_loss_normalized', row['neighbour_rank_loss']):.4f}",
+            f"BCE={row['bce_loss']:.4f}",
+            f"PairRank={row['pair_rank_loss']:.4f}",
+            f"InBatchRank={row['inbatch_rank_loss']:.4f}",
+            f"HardCrossNeighRank={row['neighbour_rank_loss']:.4f}",
         ]
 
         if eval_metrics:
@@ -1077,17 +947,15 @@ def train_model(
                 "lambda_neighbour_rank": lambda_neighbour_rank,
                 "rank_margin": rank_margin,
                 "neighbour_margin": neighbour_margin,
-                "loss_normalization": loss_normalization,
-                "loss_scale_ema_decay": loss_scale_ema_decay,
-                "loss_scale_eps": loss_scale_eps,
-                "loss_scales": dict(loss_scales),
                 "auto_loss_weighting": auto_loss_weighting,
                 "auto_loss_reference": auto_loss_reference,
                 "auto_loss_scale_batches": auto_loss_scale_batches,
                 "auto_loss_scale_statistic": auto_loss_scale_statistic,
                 "auto_loss_scales": dict(auto_loss_scales),
                 "auto_loss_weights": dict(auto_loss_weights),
-                "configured_loss_gates": dict(configured_loss_gates),
+                "configured_loss_coefficients": dict(
+                    configured_loss_coefficients
+                ),
 
                 "model_name": model_name,
                 "train_dataset": train_dataset,

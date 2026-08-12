@@ -180,6 +180,9 @@ def normalize_dataset_key(dataset_name: str) -> str:
     if "trivia" in name:
         return "triviaqa"
 
+    if "squad" in name:
+        return "squadqa"
+
     return name
 
 

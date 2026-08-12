@@ -1,3 +1,5 @@
+import argparse
+import ast
 import os
 import re
 import random
@@ -13,6 +15,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # ============================================================
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+TRIVIAQA_DATASET_ID = "mandarjoshi/trivia_qa"
+TRUTHFULQA_DATASET_ID = "domenicrosati/TruthfulQA"
 
 DEVICE = (
     "cuda" if torch.cuda.is_available()
@@ -421,23 +425,119 @@ def save_checkpoint(examples):
     df.to_csv(CHECKPOINT_PATH, index=False)
 
 
+def parse_checkpoint_negatives(value):
+    if isinstance(value, list):
+        return [
+            clean_text(item)
+            for item in value
+            if clean_text(item) is not None
+        ]
+
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+
+    try:
+        parsed = ast.literal_eval(str(value))
+    except (SyntaxError, ValueError):
+        parsed = [value]
+
+    if not isinstance(parsed, list):
+        parsed = [parsed]
+
+    return [
+        clean_text(item)
+        for item in parsed
+        if clean_text(item) is not None
+    ]
+
+
+def load_checkpoint_examples():
+    if not os.path.exists(CHECKPOINT_PATH):
+        print(f"No checkpoint found at {CHECKPOINT_PATH}; starting from scratch.")
+        return []
+
+    df = pd.read_csv(CHECKPOINT_PATH)
+    examples = []
+
+    for row in df.to_dict(orient="records"):
+        dataset_name = clean_text(row.get("dataset"))
+        question = clean_text(row.get("question"))
+        positive = clean_text(row.get("positive"))
+        negatives = parse_checkpoint_negatives(row.get("negatives"))
+        short_answer = row.get("short_answer")
+
+        if isinstance(short_answer, float) and pd.isna(short_answer):
+            short_answer = None
+        else:
+            short_answer = clean_text(short_answer)
+
+        if (
+            dataset_name is None
+            or question is None
+            or positive is None
+            or len(negatives) == 0
+        ):
+            continue
+
+        examples.append(
+            {
+                "dataset": dataset_name,
+                "question": question,
+                "short_answer": short_answer,
+                "positive": positive,
+                "negatives": negatives,
+            }
+        )
+
+    print(
+        f"Loaded {len(examples)} grouped examples from checkpoint: "
+        f"{CHECKPOINT_PATH}"
+    )
+    return examples
+
+
+def checkpoint_with_prefix(prefix_examples, current_examples):
+    save_checkpoint([
+        *(prefix_examples or []),
+        *current_examples,
+    ])
+
+
+def existing_questions(examples, dataset_names):
+    dataset_names = set(dataset_names)
+    return {
+        ex["question"]
+        for ex in examples
+        if ex.get("dataset") in dataset_names
+    }
+
+
 # ============================================================
 # Process HotpotQA
 # ============================================================
 
-def process_hotpotqa(split="train", max_samples=1000):
+def process_hotpotqa(
+    split="train",
+    max_samples=1000,
+    checkpoint_prefix=None,
+    skip_questions=None,
+):
     print("\nLoading HotpotQA...")
 
     ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split=split)
     ds = safe_select_dataset(ds, max_samples)
 
     examples = []
+    skip_questions = set(skip_questions or [])
 
     for ex in tqdm(ds, desc="Processing HotpotQA"):
         question = clean_text(ex.get("question"))
         short_answer = clean_text(ex.get("answer"))
 
         if question is None or short_answer is None:
+            continue
+
+        if question in skip_questions:
             continue
 
         positive = convert_answer_to_full_sentence(
@@ -473,7 +573,7 @@ def process_hotpotqa(split="train", max_samples=1000):
         )
 
         if len(examples) % 100 == 0:
-            save_checkpoint(examples)
+            checkpoint_with_prefix(checkpoint_prefix, examples)
 
     return examples
 
@@ -501,19 +601,32 @@ def extract_triviaqa_answer(ex):
     return None
 
 
-def process_triviaqa_wiki(split="train", max_samples=1000):
+def process_triviaqa_wiki(
+    split="train",
+    max_samples=1000,
+    checkpoint_prefix=None,
+    skip_questions=None,
+):
     print("\nLoading TriviaQA Wiki...")
 
-    ds = load_dataset("trivia_qa", "rc.wikipedia", split=split)
+    ds = load_dataset(
+        TRIVIAQA_DATASET_ID,
+        "rc.wikipedia",
+        split=split,
+    )
     ds = safe_select_dataset(ds, max_samples)
 
     examples = []
+    skip_questions = set(skip_questions or [])
 
     for ex in tqdm(ds, desc="Processing TriviaQA Wiki"):
         question = clean_text(ex.get("question"))
         short_answer = extract_triviaqa_answer(ex)
 
         if question is None or short_answer is None:
+            continue
+
+        if question in skip_questions:
             continue
 
         positive = convert_answer_to_full_sentence(
@@ -549,7 +662,7 @@ def process_triviaqa_wiki(split="train", max_samples=1000):
         )
 
         if len(examples) % 100 == 0:
-            save_checkpoint(examples)
+            checkpoint_with_prefix(checkpoint_prefix, examples)
 
     return examples
 
@@ -560,13 +673,19 @@ def process_triviaqa_wiki(split="train", max_samples=1000):
 # Uses original Question, Best Answer, and Incorrect Answers.
 # ============================================================
 
-def process_truthfulqa(split="train", max_samples=1000):
+def process_truthfulqa(
+    split="train",
+    max_samples=1000,
+    checkpoint_prefix=None,
+    skip_questions=None,
+):
     print("\nLoading TruthfulQA...")
 
-    ds = load_dataset("TruthfulQA", split=split)
+    ds = load_dataset(TRUTHFULQA_DATASET_ID, split=split)
     ds = safe_select_dataset(ds, max_samples)
 
     examples = []
+    skip_questions = set(skip_questions or [])
 
     for ex in tqdm(ds, desc="Processing TruthfulQA"):
         question = ex.get("Question")
@@ -574,6 +693,11 @@ def process_truthfulqa(split="train", max_samples=1000):
         incorrect_str = ex.get("Incorrect Answers", "")
 
         if not question or not positive or not incorrect_str:
+            continue
+
+        question = question.strip()
+
+        if question in skip_questions:
             continue
 
         negatives = [
@@ -585,14 +709,100 @@ def process_truthfulqa(split="train", max_samples=1000):
         if negatives:
             examples.append({
                 "dataset": "truthfulqa",
-                "question": question.strip(),
+                "question": question,
                 "short_answer": positive.strip(),
                 "positive": positive.strip(),
                 "negatives": negatives,
             })
 
         if len(examples) % 100 == 0:
-            save_checkpoint(examples)
+            checkpoint_with_prefix(checkpoint_prefix, examples)
+
+    return examples
+
+
+# ============================================================
+# Process SQuAD
+# ============================================================
+
+def extract_squad_answer(ex):
+    answers = ex.get("answers")
+
+    if not isinstance(answers, dict):
+        return None
+
+    answer_texts = answers.get("text", [])
+
+    if isinstance(answer_texts, str):
+        answer_texts = [answer_texts]
+
+    for answer_text in answer_texts:
+        answer = clean_text(answer_text)
+
+        if answer is not None:
+            return answer
+
+    return None
+
+
+def process_squadqa(
+    split="train",
+    max_samples=1000,
+    checkpoint_prefix=None,
+    skip_questions=None,
+):
+    print("\nLoading SQuAD...")
+
+    ds = load_dataset("rajpurkar/squad", split=split)
+    ds = safe_select_dataset(ds, max_samples)
+
+    examples = []
+    skip_questions = set(skip_questions or [])
+
+    for ex in tqdm(ds, desc="Processing SQuAD"):
+        question = clean_text(ex.get("question"))
+        short_answer = extract_squad_answer(ex)
+
+        if question is None or short_answer is None:
+            continue
+
+        if question in skip_questions:
+            continue
+
+        positive = convert_answer_to_full_sentence(
+            question=question,
+            short_answer=short_answer,
+        )
+
+        if not is_valid_answer(positive):
+            print("Bad positive:", positive)
+            continue
+
+        negative = generate_negative_answer(
+            question=question,
+            correct_answer=positive,
+        )
+
+        if not is_valid_answer(negative):
+            print("Bad negative:", negative)
+            continue
+
+        if positive.lower() == negative.lower():
+            print("Skipped identical positive/negative:", positive)
+            continue
+
+        examples.append(
+            make_example(
+                dataset_name="squadqa",
+                question=question,
+                short_answer=short_answer,
+                positive=positive,
+                negatives=[negative],
+            )
+        )
+
+        if len(examples) % 100 == 0:
+            checkpoint_with_prefix(checkpoint_prefix, examples)
 
     return examples
 
@@ -625,29 +835,83 @@ def flatten_examples(examples):
 # Main
 # ============================================================
 
-def build_dataset(save_flattened=True):
-    all_examples = []
+def build_dataset(
+    save_flattened=True,
+    dataset_names=None,
+    resume=False,
+):
+    if dataset_names is None:
+        dataset_names = [
+            "hotpotqa",
+            "triviaqa",
+            "truthfulqa",
+            "squadqa",
+        ]
 
-    hotpot_examples = process_hotpotqa(
-        split="train",
-        max_samples=MAX_SAMPLES_PER_DATASET,
-    )
-    all_examples.extend(hotpot_examples)
-    save_checkpoint(all_examples)
+    requested_datasets = set(dataset_names)
+    supported_datasets = {
+        "hotpotqa",
+        "triviaqa",
+        "truthfulqa",
+        "squadqa",
+    }
+    unknown_datasets = requested_datasets - supported_datasets
 
-    trivia_examples = process_triviaqa_wiki(
-        split="train",
-        max_samples=MAX_SAMPLES_PER_DATASET,
-    )
-    all_examples.extend(trivia_examples)
-    save_checkpoint(all_examples)
+    if unknown_datasets:
+        raise ValueError(
+            "Unknown dataset names: "
+            f"{sorted(unknown_datasets)}. "
+            f"Choose from: {sorted(supported_datasets)}."
+        )
 
-    truthfulqa_examples = process_truthfulqa(
-        split="train",
-        max_samples=MAX_SAMPLES_PER_DATASET,
-    )
-    all_examples.extend(truthfulqa_examples)
-    save_checkpoint(all_examples)
+    all_examples = load_checkpoint_examples() if resume else []
+
+    processors = [
+        (
+            "hotpotqa",
+            {"hotpotqa"},
+            process_hotpotqa,
+        ),
+        (
+            "triviaqa",
+            {"triviaqa", "triviaqa_wiki"},
+            process_triviaqa_wiki,
+        ),
+        (
+            "truthfulqa",
+            {"truthfulqa"},
+            process_truthfulqa,
+        ),
+        (
+            "squadqa",
+            {"squadqa"},
+            process_squadqa,
+        ),
+    ]
+
+    for dataset_key, checkpoint_names, processor in processors:
+        if dataset_key not in requested_datasets:
+            continue
+
+        skip_questions = existing_questions(
+            all_examples,
+            checkpoint_names,
+        )
+
+        if skip_questions:
+            print(
+                f"Resuming {dataset_key}: skipping "
+                f"{len(skip_questions)} checkpointed questions."
+            )
+
+        new_examples = processor(
+            split="train",
+            max_samples=MAX_SAMPLES_PER_DATASET,
+            checkpoint_prefix=all_examples,
+            skip_questions=skip_questions,
+        )
+        all_examples.extend(new_examples)
+        save_checkpoint(all_examples)
 
     if save_flattened:
         rows = flatten_examples(all_examples)
@@ -686,5 +950,47 @@ def build_dataset(save_flattened=True):
     return df
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate paired truthful and hallucinated QA claims."
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=[
+            "hotpotqa",
+            "triviaqa",
+            "truthfulqa",
+            "squadqa",
+        ],
+        default=[
+            "hotpotqa",
+            "triviaqa",
+            "truthfulqa",
+            "squadqa",
+        ],
+        help="Datasets to process, in canonical pipeline order.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Load the grouped checkpoint, preserve existing examples, "
+            "and skip already checkpointed questions."
+        ),
+    )
+    parser.add_argument(
+        "--grouped-output",
+        action="store_true",
+        help="Write grouped negatives instead of flattened pairwise rows.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    df = build_dataset(save_flattened=True)
+    args = parse_args()
+    df = build_dataset(
+        save_flattened=not args.grouped_output,
+        dataset_names=args.datasets,
+        resume=args.resume,
+    )
