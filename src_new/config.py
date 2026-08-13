@@ -59,10 +59,7 @@ PLOT_DIR = "outputs_qwen_k_sweep_rawloss_weighted_llmknn/plots"
 # Semantic neighbour settings
 # ============================================================
 
-K_NEIGHBOURS = 5
 NEIGHBOUR_K_SWEEP = [3, 5, 10, 20]
-NEIGHBOUR_BACKEND = "sentence"
-NEIGHBOUR_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 # ============================================================
@@ -109,10 +106,10 @@ USE_FEATURE_STANDARDIZATION = False
 # Tuning grid
 # ============================================================
 
-def make_neighbour_config(name_prefix, backend, k):
+def make_llm_hidden_config(k):
     return {
-        "name": f"{name_prefix}_k{k}_rawloss",
-        "neighbour_backend": backend,
+        "name": f"llm_hidden_k{k}_rawloss",
+        "neighbour_backend": "llm_hidden",
         "k_neighbours": k,
         "lambda_bce": LAMBDA_BCE,
         "lambda_pair_rank": LAMBDA_PAIR_RANK,
@@ -125,8 +122,8 @@ def make_neighbour_config(name_prefix, backend, k):
     }
 
 
-# These configs isolate the effect of neighbour source and K while holding the
-# raw-loss coefficients fixed.
+# Compare the no-neighbour control with frozen-LLM hidden-state neighbours
+# while holding every loss coefficient and model hyperparameter fixed.
 TUNING_CONFIGS = [
     {
         "name": "no_neighbour_pair_inbatch",
@@ -142,15 +139,7 @@ TUNING_CONFIGS = [
         "weight_decay": WEIGHT_DECAY,
     },
     *[
-        make_neighbour_config("tfidf", "tfidf", k)
-        for k in NEIGHBOUR_K_SWEEP
-    ],
-    *[
-        make_neighbour_config("dense", "sentence", k)
-        for k in NEIGHBOUR_K_SWEEP
-    ],
-    *[
-        make_neighbour_config("llm_hidden", "llm_hidden", k)
+        make_llm_hidden_config(k)
         for k in NEIGHBOUR_K_SWEEP
     ],
 ]

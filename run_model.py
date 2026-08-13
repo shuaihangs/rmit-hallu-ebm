@@ -37,7 +37,6 @@ from src_new.config import (
     AUTO_LOSS_SCALE_BATCHES,
     AUTO_LOSS_SCALE_STATISTIC,
 
-    NEIGHBOUR_EMBEDDING_MODEL,
     TUNING_CONFIGS,
 
     PROJ_DIM,
@@ -235,7 +234,6 @@ def print_run_settings(models, train_datasets, configs, args):
     print(f"CACHE_FROZEN_LLM_FEATURES: {CACHE_FROZEN_LLM_FEATURES}")
     print(f"FEATURE_CACHE_DIR: {FEATURE_CACHE_DIR}")
     print(f"FEATURE_CACHE_BATCH_SIZE: {FEATURE_CACHE_BATCH_SIZE}")
-    print(f"NEIGHBOUR_EMBEDDING_MODEL: {NEIGHBOUR_EMBEDDING_MODEL}")
     print(f"PROJ_DIM: {PROJ_DIM}")
     print(f"NORMALIZE_PROJECTED_STATES: {NORMALIZE_PROJECTED_STATES}")
     print(f"USE_FEATURE_STANDARDIZATION: {USE_FEATURE_STANDARDIZATION}")
@@ -438,7 +436,6 @@ def run_dataset_experiment(
         num_workers=0,
         k_neighbours=config_value(config, "k_neighbours"),
         neighbour_backend=config_value(config, "neighbour_backend"),
-        neighbour_embedding_model=NEIGHBOUR_EMBEDDING_MODEL,
         neighbour_llm_base_model=base_model,
         neighbour_llm_device=DEVICE,
         neighbour_llm_batch_size=BATCH_SIZE,

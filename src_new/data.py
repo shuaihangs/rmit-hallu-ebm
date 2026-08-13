@@ -14,6 +14,11 @@ from sklearn.neighbors import NearestNeighbors
 _NEIGHBOUR_INDEX_CACHE = {}
 
 
+def question_identity(question: str) -> str:
+    """Canonical identity used to keep repeated question variants together."""
+    return " ".join(str(question).split()).casefold()
+
+
 def get_selected_layer_indices(total_layers: int):
     if total_layers <= 0:
         raise ValueError("total_layers must be positive.")
@@ -740,8 +745,7 @@ class PairClaimDataset(Dataset):
         rows,
         use_short_answer=False,
         k_neighbours=5,
-        neighbour_backend="sentence",
-        neighbour_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+        neighbour_backend="llm_hidden",
         llm_tokenizer=None,
         llm_base_model=None,
         llm_device=None,
@@ -753,7 +757,6 @@ class PairClaimDataset(Dataset):
         self.use_short_answer = use_short_answer
         self.k_neighbours = k_neighbours
         self.neighbour_backend = neighbour_backend
-        self.neighbour_embedding_model = neighbour_embedding_model
         self.llm_tokenizer = llm_tokenizer
         self.llm_base_model = llm_base_model
         self.llm_device = llm_device
@@ -764,7 +767,6 @@ class PairClaimDataset(Dataset):
         self.neighbour_indices = self._build_neighbour_indices(
             k=k_neighbours,
             backend=neighbour_backend,
-            embedding_model_name=neighbour_embedding_model,
         )
 
     def __len__(self):
@@ -782,32 +784,54 @@ class PairClaimDataset(Dataset):
         self,
         k,
         backend,
-        embedding_model_name,
     ):
         """
         Build K nearest question neighbours among training questions.
 
         Supported backends:
-            none     -> no neighbours
-            tfidf    -> sparse lexical nearest neighbours
-            sentence -> dense sentence-embedding nearest neighbours
+            none       -> no neighbours
             llm_hidden -> frozen base-LLM hidden-state question neighbours
 
         The returned indices point into self.rows.
         """
         backend = str(backend or "none").strip().lower()
 
-        if backend in {"none", "off", "disabled"} or k <= 0 or len(self.rows) <= 1:
+        if backend not in {"none", "llm_hidden"}:
+            raise ValueError(
+                "Unknown neighbour backend: "
+                f"{backend}. Use one of: none, llm_hidden."
+            )
+
+        if backend == "none" or k <= 0 or len(self.rows) <= 1:
             return [[] for _ in self.rows]
 
-        questions = [r["question"] for r in self.rows]
+        unique_questions = []
+        representative_row_indices = []
+        question_group_by_key = {}
+        row_group_indices = []
+
+        for row_idx, row in enumerate(self.rows):
+            key = question_identity(row["question"])
+            group_idx = question_group_by_key.get(key)
+
+            if group_idx is None:
+                group_idx = len(unique_questions)
+                question_group_by_key[key] = group_idx
+                unique_questions.append(row["question"])
+                representative_row_indices.append(row_idx)
+
+            row_group_indices.append(group_idx)
+
+        if len(unique_questions) <= 1:
+            return [[] for _ in self.rows]
+
         question_digest = hashlib.sha1(
-            "\n".join(questions).encode("utf-8")
+            "\n".join(question_identity(q) for q in unique_questions).encode("utf-8")
         ).hexdigest()
         cache_key = (
+            "unique_question_knn_v1",
             backend,
             int(k),
-            str(embedding_model_name),
             str(getattr(getattr(self.llm_base_model, "config", None), "_name_or_path", "")),
             int(self.llm_hidden_max_length),
             int(self.llm_hidden_batch_size),
@@ -817,74 +841,12 @@ class PairClaimDataset(Dataset):
         if cache_key in _NEIGHBOUR_INDEX_CACHE:
             print(
                 f"Using cached {backend} question neighbours "
-                f"(k={k}, rows={len(self.rows)})."
+                f"(k={k}, unique_questions={len(unique_questions)}, "
+                f"rows={len(self.rows)})."
             )
             return _NEIGHBOUR_INDEX_CACHE[cache_key]
 
-        if backend == "tfidf":
-            try:
-                from sklearn.feature_extraction.text import TfidfVectorizer
-
-                print(
-                    f"Building TF-IDF question neighbours "
-                    f"(k={k}, rows={len(self.rows)})..."
-                )
-                vectorizer = TfidfVectorizer(
-                    lowercase=True,
-                    stop_words="english",
-                    max_features=50000,
-                )
-                features = vectorizer.fit_transform(questions)
-                n_neighbours = min(k + 1, len(self.rows))
-                index = NearestNeighbors(
-                    n_neighbors=n_neighbours,
-                    metric="cosine",
-                    algorithm="brute",
-                )
-                index.fit(features)
-                _, nearest_indices = index.kneighbors(features)
-
-            except Exception as e:
-                raise RuntimeError(
-                    "Could not build TF-IDF neighbours. "
-                    "Check scikit-learn and the input questions."
-                ) from e
-
-        elif backend in {"sentence", "embedding", "dense"}:
-            try:
-                from sentence_transformers import SentenceTransformer
-
-                print(
-                    "Building sentence-embedding question neighbours with "
-                    f"{embedding_model_name} (k={k}, rows={len(self.rows)})..."
-                )
-
-                embedder = SentenceTransformer(embedding_model_name)
-                embeddings = embedder.encode(
-                    questions,
-                    batch_size=64,
-                    normalize_embeddings=True,
-                    show_progress_bar=True,
-                )
-
-                embeddings = np.asarray(embeddings)
-                n_neighbours = min(k + 1, len(self.rows))
-
-                index = NearestNeighbors(
-                    n_neighbors=n_neighbours,
-                    metric="cosine",
-                )
-                index.fit(embeddings)
-                _, nearest_indices = index.kneighbors(embeddings)
-
-            except Exception as e:
-                raise RuntimeError(
-                    "Could not build sentence-embedding neighbours. "
-                    "Install sentence-transformers in the active environment or "
-                    "check the embedding model name."
-                ) from e
-
-        elif backend in {"llm_hidden", "llm", "hidden"}:
+        if backend == "llm_hidden":
             try:
                 model_name = str(
                     getattr(
@@ -897,11 +859,12 @@ class PairClaimDataset(Dataset):
                 print(
                     "Building frozen-LLM hidden-state question neighbours "
                     f"with {model_name} "
-                    f"(k={k}, rows={len(self.rows)})..."
+                    f"(k={k}, unique_questions={len(unique_questions)}, "
+                    f"rows={len(self.rows)})..."
                 )
 
                 embeddings = build_llm_hidden_question_embeddings(
-                    questions=questions,
+                    questions=unique_questions,
                     tokenizer=self.llm_tokenizer,
                     base_model=self.llm_base_model,
                     device=self.llm_device,
@@ -909,7 +872,7 @@ class PairClaimDataset(Dataset):
                     max_length=self.llm_hidden_max_length,
                 )
 
-                n_neighbours = min(k + 1, len(self.rows))
+                n_neighbours = min(k + 1, len(unique_questions))
                 index = NearestNeighbors(
                     n_neighbors=n_neighbours,
                     metric="cosine",
@@ -925,21 +888,23 @@ class PairClaimDataset(Dataset):
                     "build_dataloaders."
                 ) from e
 
-        else:
-            raise ValueError(
-                "Unknown neighbour backend: "
-                f"{backend}. Use one of: none, tfidf, sentence, llm_hidden."
-            )
+        neighbours_by_group = []
 
-        neighbours = []
-
-        for i, row_indices in enumerate(nearest_indices):
-            row_indices = [
+        for group_idx, neighbour_group_indices in enumerate(nearest_indices):
+            neighbour_group_indices = [
                 int(j)
-                for j in row_indices
-                if int(j) != i
+                for j in neighbour_group_indices
+                if int(j) != group_idx
             ]
-            neighbours.append(row_indices[:k])
+            neighbours_by_group.append([
+                representative_row_indices[j]
+                for j in neighbour_group_indices[:k]
+            ])
+
+        neighbours = [
+            list(neighbours_by_group[group_idx])
+            for group_idx in row_group_indices
+        ]
 
         _NEIGHBOUR_INDEX_CACHE[cache_key] = neighbours
         return neighbours
@@ -1016,9 +981,12 @@ class PairClaimDataset(Dataset):
 
 def build_question_neighbour_indices(
     rows,
+    tokenizer,
+    base_model,
+    device,
     k=5,
-    backend="sentence",
-    embedding_model_name="sentence-transformers/all-MiniLM-L6-v2",
+    batch_size=16,
+    max_length=128,
 ):
     """
     Build question-neighbour indices using the same implementation as training.
@@ -1030,8 +998,12 @@ def build_question_neighbour_indices(
         rows=rows,
         use_short_answer=False,
         k_neighbours=k,
-        neighbour_backend=backend,
-        neighbour_embedding_model=embedding_model_name,
+        neighbour_backend="llm_hidden",
+        llm_tokenizer=tokenizer,
+        llm_base_model=base_model,
+        llm_device=device,
+        llm_hidden_batch_size=batch_size,
+        llm_hidden_max_length=max_length,
     )
     return dataset.neighbour_indices
 
@@ -1183,8 +1155,7 @@ def build_dataloaders(
     use_short_answer=False,
     num_workers=0,
     k_neighbours=5,
-    neighbour_backend="sentence",
-    neighbour_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+    neighbour_backend="llm_hidden",
     neighbour_llm_base_model=None,
     neighbour_llm_device=None,
     neighbour_llm_batch_size=16,
@@ -1310,7 +1281,6 @@ def build_dataloaders(
         use_short_answer=use_short_answer,
         k_neighbours=k_neighbours,
         neighbour_backend=neighbour_backend,
-        neighbour_embedding_model=neighbour_embedding_model,
         llm_tokenizer=tokenizer,
         llm_base_model=neighbour_llm_base_model,
         llm_device=neighbour_llm_device,
