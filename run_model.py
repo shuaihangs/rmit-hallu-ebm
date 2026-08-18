@@ -26,6 +26,7 @@ from src_new.config import (
     CACHE_FROZEN_LLM_FEATURES,
     FEATURE_CACHE_DIR,
     FEATURE_CACHE_BATCH_SIZE,
+    NEIGHBOUR_LLM_BATCH_SIZE,
     VALIDATION_RATIO,
     CSV_PATH,
     DATASET_NAMES,
@@ -47,6 +48,7 @@ from src_new.config import (
 from src_new.utils import set_seed
 
 from src_new.data import (
+    QUESTION_GROUPED_SPLIT_STRATEGY,
     load_rows_from_csv,
     split_examples_by_dataset,
     print_dataset_counts,
@@ -234,6 +236,7 @@ def print_run_settings(models, train_datasets, configs, args):
     print(f"CACHE_FROZEN_LLM_FEATURES: {CACHE_FROZEN_LLM_FEATURES}")
     print(f"FEATURE_CACHE_DIR: {FEATURE_CACHE_DIR}")
     print(f"FEATURE_CACHE_BATCH_SIZE: {FEATURE_CACHE_BATCH_SIZE}")
+    print(f"NEIGHBOUR_LLM_BATCH_SIZE: {NEIGHBOUR_LLM_BATCH_SIZE}")
     print(f"PROJ_DIM: {PROJ_DIM}")
     print(f"NORMALIZE_PROJECTED_STATES: {NORMALIZE_PROJECTED_STATES}")
     print(f"USE_FEATURE_STANDARDIZATION: {USE_FEATURE_STANDARDIZATION}")
@@ -438,7 +441,7 @@ def run_dataset_experiment(
         neighbour_backend=config_value(config, "neighbour_backend"),
         neighbour_llm_base_model=base_model,
         neighbour_llm_device=DEVICE,
-        neighbour_llm_batch_size=BATCH_SIZE,
+        neighbour_llm_batch_size=NEIGHBOUR_LLM_BATCH_SIZE,
         cache_frozen_features=CACHE_FROZEN_LLM_FEATURES,
         feature_cache_base_model=base_model,
         feature_cache_energy_model=energy_model,
@@ -477,7 +480,10 @@ def run_dataset_experiment(
         model_name=model_name,
         train_dataset=train_dataset,
         config_name=config_value(config, "name"),
-        experiment_config=dict(config),
+        experiment_config={
+            **dict(config),
+            "split_strategy": splits["split_strategy"],
+        },
         eval_datasets=loaders["eval_datasets"],
         monitor_datasets=loaders["monitor_datasets"],
         early_stopping_patience=args.patience,
@@ -524,6 +530,7 @@ def run_dataset_experiment(
         "config_name": config_value(config, "name"),
         "model_name": model_name,
         "train_dataset": train_dataset,
+        "split_strategy": splits["split_strategy"],
         "checkpoint_path": best_ckpt_path,
         "best_epoch": best_epoch,
         "stopped_epoch": stopped_epoch,
@@ -607,6 +614,13 @@ def load_resume_rows():
     import pandas as pd
 
     existing = pd.read_csv(summary_path)
+    if "split_strategy" not in existing.columns:
+        print(
+            "\nExisting summary predates question-grouped splitting; "
+            "no legacy rows will be resumed."
+        )
+        return [], set()
+
     required_columns = {
         "model_name",
         "config_name",
@@ -618,6 +632,17 @@ def load_resume_rows():
         raise ValueError(
             "Cannot resume summary with missing columns: "
             + ", ".join(sorted(missing_columns))
+        )
+
+    matching_strategy = existing["split_strategy"].astype(str).eq(
+        QUESTION_GROUPED_SPLIT_STRATEGY
+    )
+    discarded_rows = int((~matching_strategy).sum())
+    existing = existing[matching_strategy].copy()
+    if discarded_rows:
+        print(
+            f"\nDiscarded {discarded_rows} resume rows produced with a "
+            "different split strategy."
         )
 
     complete_keys = set()

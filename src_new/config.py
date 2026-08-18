@@ -15,10 +15,7 @@ MODEL_NAME = MODEL_NAMES[0]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 MAX_LENGTH = 128
-
-# Reproduction setting for the HotpotQA -> TruthfulQA LLM-hidden K=5 result
-# (AUC ~= 0.6725).
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 
 LR = 2e-4
 MAX_EPOCHS = 25
@@ -36,6 +33,9 @@ VALIDATION_RATIO = 0.2
 CACHE_FROZEN_LLM_FEATURES = True
 FEATURE_CACHE_DIR = "outputs_qwen_k_sweep_rawloss_weighted_llmknn/feature_cache"
 FEATURE_CACHE_BATCH_SIZE = 16
+
+# Keep neighbour construction fixed when sweeping the optimizer batch size.
+NEIGHBOUR_LLM_BATCH_SIZE = 8
 
 
 # ============================================================

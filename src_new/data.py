@@ -12,6 +12,7 @@ from sklearn.neighbors import NearestNeighbors
 
 
 _NEIGHBOUR_INDEX_CACHE = {}
+QUESTION_GROUPED_SPLIT_STRATEGY = "question_grouped_seed_plus_dataset_index"
 
 
 def question_identity(question: str) -> str:
@@ -222,6 +223,61 @@ def rows_to_claim_examples(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return examples
 
 
+def split_rows_by_question(
+    rows: List[Dict[str, Any]],
+    validation_ratio: float,
+    rng: random.Random,
+):
+    """Split rows while keeping every normalized question in one partition."""
+    if not rows:
+        return [], []
+
+    question_groups = {}
+    for row in rows:
+        key = question_identity(row["question"])
+        question_groups.setdefault(key, []).append(row)
+
+    groups = list(question_groups.values())
+    rng.shuffle(groups)
+
+    # A question-disjoint validation set is impossible with only one group.
+    if validation_ratio <= 0.0 or len(groups) <= 1:
+        return [row for group in groups for row in group], []
+
+    target_validation_rows = max(1, int(len(rows) * validation_ratio))
+    target_validation_rows = min(target_validation_rows, len(rows) - 1)
+
+    validation_groups = []
+    train_groups = []
+    validation_row_count = 0
+
+    # Pack whole question groups without exceeding the historical row-level
+    # target. For the experiment datasets this preserves the original split
+    # sizes while preventing duplicate questions from crossing partitions.
+    for group in groups:
+        if validation_row_count + len(group) <= target_validation_rows:
+            validation_groups.append(group)
+            validation_row_count += len(group)
+        else:
+            train_groups.append(group)
+
+    if not validation_groups:
+        validation_groups.append(train_groups.pop(0))
+
+    validation_rows = [
+        row
+        for group in validation_groups
+        for row in group
+    ]
+    train_rows = [
+        row
+        for group in train_groups
+        for row in group
+    ]
+
+    return train_rows, validation_rows
+
+
 def split_examples_by_dataset(
     rows: List[Dict[str, Any]],
     dataset_names=None,
@@ -260,20 +316,11 @@ def split_examples_by_dataset(
     for dataset_idx, dataset in enumerate(datasets.values()):
         dataset_rows = list(dataset["rows"])
         rng = random.Random(seed + dataset_idx)
-        rng.shuffle(dataset_rows)
-
-        if validation_ratio > 0.0 and len(dataset_rows) > 1:
-            n_validation = max(1, int(len(dataset_rows) * validation_ratio))
-            n_validation = min(n_validation, len(dataset_rows) - 1)
-        else:
-            n_validation = 0
-
-        validation_rows = dataset_rows[:n_validation]
-        train_rows = dataset_rows[n_validation:]
-
-        if len(train_rows) == 0:
-            train_rows = dataset_rows
-            validation_rows = dataset_rows
+        train_rows, validation_rows = split_rows_by_question(
+            rows=dataset_rows,
+            validation_ratio=validation_ratio,
+            rng=rng,
+        )
 
         dataset["train_rows"] = train_rows
         dataset["validation_rows"] = validation_rows
@@ -286,6 +333,7 @@ def split_examples_by_dataset(
         "rows": rows,
         "examples": all_examples,
         "dataset_names": dataset_names,
+        "split_strategy": QUESTION_GROUPED_SPLIT_STRATEGY,
         "datasets": datasets,
     }
 
